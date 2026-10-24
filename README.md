@@ -15,7 +15,8 @@ columns of the primary key are known (`strategy.go`):
   is smaller — the servers do that. Details below.
 
 Both have a parallel mode: ranges are taken from the histogram of the
-(first) key column.
+(first) key column, or cut by the slicer into blocks of a fixed number of
+rows in one pass over the key index.
 
 ## Build
 
@@ -138,10 +139,26 @@ two sides, `char(n)`, `bit(n)`, a composite with a repeated value in the histogr
 first column, a table that consists of the key only, skew, empty sides. On the
 test side, 3 updates, 3 deletes and 4 inserts are planted, including
 some below the minimum and above the maximum key; pgcmp must find exactly these
-with `-mem 1` (dozens of blocks), with one large block and with `-j 4`, and the
-report lines must match. Partitioned tables and inheritance
-parents must be rejected, while their partitions and children must
-be compared.
+with `-mem 1` (dozens of blocks), with one large block, with `-j 4` and with
+the slicer in blocks of 1000 rows, and the report lines must match.
+Partitioned tables and inheritance parents must be rejected, while their
+partitions and children must be compared.
+
+The slicer (same setup, local clusters):
+
+```sh
+test/slicer.sh         # ROWS=200000 by default
+```
+
+Blocks of a fixed number of rows must give the report of a sequential run:
+byte for byte for merge, the same lines for hash blocks. Differences are
+planted on block bounds and next to them, on the first and the last key,
+below the minimum and above the maximum of the reference side. Then: empty
+tables, one row, exactly N rows (one bound, the second block empty on the
+reference side), N - 1 and N + 1 rows, blocks of one row, hash sub-blocks
+inside a block, a `regproc` key, a filter that keeps 1 % of the rows (the
+blocks are counted over those), a table never analysed; which way `-split`
+takes and why; the warning when the slicer cannot walk the index.
 
 ## Usage
 
@@ -152,6 +169,7 @@ be compared.
         [-columns id,amount,status] \
         [-filter "status <> 'archived'"] \
         [-j 4] \
+        [-split histogram|fixed|none] \
         [-mem 64MB] \
         [-rows 3000] \
         [-out orders.diff]
@@ -169,15 +187,21 @@ be compared.
 * `-j` — the number of parallel workers (1 by default). Each worker is
   a pair of connections, one per server; the coordinator's own pair is one of
   them, so each server needs `j` connections.
+* `-split` — how to cut the key space for the workers, by priority (see
+  "Parallel mode"): `histogram` (by default) — the histogram of the first key
+  column, or the slicer if the histogram cannot be used; `fixed` — the slicer,
+  blocks of a fixed number of rows; `none` — one range, no parallelism.
 * `-mem` — memory for one block of reference-side rows (by default
-  `64MB`), for hash blocks only. Units as in PostgreSQL: `kB`, `MB`,
+  `64MB`), for hash blocks; without `-rows`, it also sets the rows of a slicer
+  block. Units as in PostgreSQL: `kB`, `MB`,
   `GB`, `TB` (powers of 1024); a number without a unit means megabytes. This is an estimate based on
   row lengths plus per-row overhead; the process RSS can be about twice as large
   because of the Go garbage collector's headroom. In parallel mode
   each worker has its own block, up to `j × mem` in total.
 * `-rows` — at most this many reference-side rows in one block (by
-  default 0 — no limit), for hash blocks only. Together with `-mem`,
-  a block is closed at whichever limit is reached first. A small block
+  default 0 — no limit). Together with `-mem`, a hash block is closed at
+  whichever limit is reached first. With the slicer, it is the number of rows
+  in a block. A small block
   lets the sides work at the same time: while the test side returns the
   range of the current block, the reference backend writes the next block into the
   socket buffers, and if the block fits in them, it has already been read by the time
@@ -230,12 +254,32 @@ order). For the same data the report is deterministic, but with a different
 
 ## Parallel mode
 
+With `-j > 1` (or with `-split fixed`), the key space is cut into ranges, and
+workers compare them independently. `-split` sets the priority of the two
+ways to cut it: `histogram` (by default) tries the histogram first and takes
+the slicer if the histogram cannot be used; `fixed` always takes the slicer;
+`none` compares one range. The log says which way was taken and, when the
+histogram was passed over, why:
+
+```
+parallel: 4 workers, 100 key ranges from the histogram of id
+parallel: 4 workers, blocks of 100000 rows (by default: the table has never been analysed) from an index scan of (id); no histogram for "public"."t".id on the reference side
+```
+
+### Histogram
+
 The key space is split by the histogram of the primary key of the reference
 table (`pg_stats.histogram_bounds`); for a composite key, by the histogram
 of its first column: one range per bin, the first one open on the left
 and the last one open on the right, so rows outside stale statistics
 are not lost. Ranges are half-open (`lo <= k1 < hi`), with no overlaps or
 gaps.
+
+The histogram cannot be used, and the slicer cuts instead, when: there is
+none (the table has not been analysed); it cannot be read (a type that cannot
+read its own text, `regproc`); `-filter` is set (the histogram describes the
+whole table, not the rows that match); or it has fewer than 4 bins per worker
+(uneven bins would leave workers idle at the end).
 
 * `histogram_bounds` has type `anyarray`: it cannot be cast,
   unnested or subscripted. So the histogram is parsed through
@@ -247,11 +291,51 @@ gaps.
   than the bin width but is not in the most common values list appears in the histogram
   several times. The server discards the repeats (`b > lag(b)`); otherwise each
   would give an empty range.
-* A type that cannot read its own text (`regproc`) gives a warning
-  and a sequential run.
+
+### Slicer
+
+The slicer cuts the key space into blocks of a fixed number of rows, N, in
+one pass over the key index of the reference table, in the snapshot of the
+coordinator transaction — the same the workers import:
+
+```sql
+DECLARE pgcmp_slice NO SCROLL CURSOR FOR
+SELECT "k1", "k2" FROM t [WHERE (<filter>)] ORDER BY t."k1", t."k2";
+MOVE FORWARD <N-1> IN pgcmp_slice; FETCH FORWARD 1 FROM pgcmp_slice;   -- per bound
+```
+
+* `MOVE` reads and discards rows without sending anything, and the cursor holds
+  the bare key columns, so nothing is computed for the skipped rows. The
+  exception is a key type whose text does not read back: `regproc` and
+  `regoper` are cast to `regprocedure` and `regoperator`.
+* `MOVE`/`FETCH` pairs go in batches, several statements in one message of the
+  simple query protocol: one round trip per batch, and the bounds come back as
+  text, the output of the column type. The first batch holds one pair, so the
+  first block is handed out after N rows; the size then doubles up to 4 per
+  worker.
+* A block is `(previous bound, bound]` on the whole key; the first is open
+  below and the last open above, so test-side rows outside the reference key
+  range are compared too. `k` bounds give `k + 1` blocks; a table shorter than N
+  rows gives one block. With `-filter`, the bounds are taken over the matching
+  rows.
+* N is `-rows` if given. Otherwise it is estimated from `-mem` and the average
+  row width of the reference table (`pg_stats.avg_width` of the compared
+  columns and the key; without statistics, the table size per row), between
+  1000 and 10 000 000 rows; for a table never analysed, 100 000. A hash block
+  is still limited by `-mem` too: a slicer block that does not fit is compared
+  in several hash blocks.
+* The slicer is not forced to use the index: before the start, `EXPLAIN` of
+  the `DECLARE` (planned as the cursor will run, with `cursor_tuple_fraction`)
+  gives a warning if it would scan and sort the table.
+* The log ends with the cost of the pass: `slicer: 200 bounds, 201 blocks in 52ms`.
+* The slicer never waits for the workers. Once it has closed the cursor, the
+  coordinator pair joins the workers; with `-j 1` the coordinator first cuts
+  the whole table, then compares the blocks itself.
+
+### Both
+
 * Within a range, hash blocks work as usual: the lower bound of the first block
   is the range bound, and so is the upper bound of the last one.
-
 * Both sides export the snapshot of the coordinator transaction
   (`pg_export_snapshot()`), and all workers import it — visibility within
   each side is the same. The coordinator pair itself works as one of the `j`
@@ -265,8 +349,6 @@ gaps.
   only ranges with differences that finished ahead of a slower one wait on disk. For merge, the report stays sorted by key and
   matches the report of a sequential run; for hash blocks the
   set of lines matches, and the order is as with a different `-mem`.
-* No histogram (the table has not been analyzed) — a warning and
-  a sequential run.
 * The server refused a connection because of `max_connections` — a warning,
   and the work continues with the workers that managed to connect, at least
   the coordinator.

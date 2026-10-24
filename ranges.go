@@ -80,6 +80,7 @@ func quoteLiteral(s string) string {
 type keySplit struct {
 	ranges []keyRange // known in advance; nil with a feed
 	feed   rangeFeed  // cuts during the run; nil with a list
+	slicer *slicer    // the slicer behind feed, if it is one
 }
 
 // inCoordinator reports whether the run compares one range right in the
@@ -122,30 +123,82 @@ func (s keySplit) planRanges() []keyRange {
 	return s.ranges
 }
 
-// splitKeys cuts the key space for opt.jobs workers. A sequential run gets
-// one range, the whole key space. Otherwise the ranges come from the
-// histogram of the first key column on the reference side (see
-// histogramRanges); without a usable histogram the run is sequential.
-func splitKeys(ctx context.Context, opt *options, ref *side, d *description, p *plan) keySplit {
-	whole := keySplit{ranges: []keyRange{{}}}
-	if opt.jobs <= 1 {
-		return whole
+// Ways to cut the key space, the values of -split. The value is the way
+// tried first; if it cannot be used, the next one is taken.
+const (
+	splitHistogram = "histogram" // the histogram; the slicer if it cannot be used
+	splitFixed     = "fixed"     // the slicer: blocks of a fixed number of rows
+	splitNone      = "none"      // one range, no parallelism
+)
+
+// minBinsPerWorker: the histogram is used only if it has at least this many
+// bins per worker. With fewer, uneven bins leave workers idle at the end.
+const minBinsPerWorker = 4
+
+// splitKeys cuts the key space for opt.jobs workers, by the priority of
+// opt.split:
+//
+//   - histogram: with one worker, one range, the whole key space; otherwise
+//     the histogram of the first key column on the reference side (see
+//     histogramRanges), if it can be used (usableHistogram), and the slicer
+//     if not;
+//   - fixed: the slicer, with any number of workers;
+//   - none: one range.
+func splitKeys(ctx context.Context, opt *options, ref *side, d *description, p *plan) (keySplit, error) {
+	switch {
+	case opt.split == splitNone, opt.split == splitHistogram && opt.jobs <= 1:
+		return keySplit{ranges: []keyRange{{}}}, nil
+	case opt.split == splitFixed:
+		return sliceSplit(ctx, opt, ref, d, p, "")
 	}
+	rs, why := usableHistogram(ctx, opt, ref, d, p)
+	if why != "" {
+		return sliceSplit(ctx, opt, ref, d, p, why)
+	}
+	log.Printf("parallel: %d workers, %d key ranges from the histogram of %s",
+		min(opt.jobs, len(rs)), len(rs), p.key[0].name)
+	return keySplit{ranges: rs}, nil
+}
+
+// usableHistogram returns the ranges of the histogram of the first key
+// column, or why the histogram cannot be used: there is none (the table
+// has not been analysed), it cannot be read, -filter is set (the histogram
+// describes the whole table, not the rows that match), or it has fewer
+// than minBinsPerWorker bins per worker.
+func usableHistogram(ctx context.Context, opt *options, ref *side, d *description, p *plan) ([]keyRange, string) {
 	k := p.key[0]
+	if strings.TrimSpace(opt.filter) != "" {
+		return nil, "-filter is set, and the histogram describes the whole table"
+	}
 	bounds, err := ref.histogram(ctx, d, k.name, k.base[0])
 	switch {
 	case err != nil:
-		log.Printf("warning: %v; running without parallelism", err)
-		return whole
+		return nil, err.Error()
 	case len(bounds) < 2:
-		log.Printf("warning: no histogram for %s.%s on the reference side (run ANALYZE); running without parallelism",
-			d.qualifiedName(), k.name)
-		return whole
+		return nil, fmt.Sprintf("no histogram for %s.%s on the reference side", d.qualifiedName(), k.name)
 	}
 	rs := histogramRanges(bounds)
-	log.Printf("parallel: %d workers, %d key ranges from the histogram of %s",
-		min(opt.jobs, len(rs)), len(rs), k.name)
-	return keySplit{ranges: rs}
+	if len(rs) < minBinsPerWorker*opt.jobs {
+		return nil, fmt.Sprintf("the histogram of %s has %d bins, fewer than %d per worker",
+			k.name, len(rs), minBinsPerWorker)
+	}
+	return rs, ""
+}
+
+// sliceSplit cuts the key space with the slicer; why, if not empty, says
+// why the histogram was passed over.
+func sliceSplit(ctx context.Context, opt *options, ref *side, d *description, p *plan, why string) (keySplit, error) {
+	workers := max(opt.jobs, 1)
+	s, how, err := newSlicer(ctx, opt, ref, d, p, workers)
+	if err != nil {
+		return keySplit{}, err
+	}
+	if why != "" {
+		why = "; " + why
+	}
+	log.Printf("parallel: %d workers, blocks of %d rows (%s) from an index scan of (%s)%s",
+		workers, s.rows, how, keyList(d.pk), why)
+	return keySplit{feed: s.feed(ref), slicer: s}, nil
 }
 
 // histogramRanges turns histogram bounds b0 < b1 < ... < bk of the first

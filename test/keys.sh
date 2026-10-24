@@ -184,19 +184,37 @@ echo "--- parallel: the same lines as a sequential run"
 for t in t_text t_comp t_uuid t_ts t_num t_enum t_char t_bit t_dup; do
 	run "$t" 512kB 1 "3 3 4" -j 4
 	if [ "$t" = t_enum ]; then
-		# Three values, all of them most common: no histogram.
-		grep -q 'no histogram' "$WORK/log" && pass "$t: no histogram, sequential" || fail "$t: expected a no-histogram warning"
+		# Three values, all of them most common: no histogram, the slicer.
+		grep -q 'no histogram.*' "$WORK/log" && grep -q 'slicer: ' "$WORK/log" && pass "$t: no histogram, the slicer" ||
+			fail "$t: expected the slicer for want of a histogram"
 	else
-		grep -q 'parallel: ' "$WORK/log" && pass "$t: $(grep -o '[0-9]* key ranges' "$WORK/log")" ||
+		grep -q 'parallel: ' "$WORK/log" && pass "$t: $(grep -oE '[0-9]* key ranges|blocks of [0-9]* rows' "$WORK/log")" ||
 			{ fail "$t: did not run in parallel"; sed 's/^/    /' "$WORK/log"; }
 	fi
 	same "$t" 512kB 256
 done
+
+# Blocks of 1000 rows cut by the slicer: about 200 bounds of every key type
+# go through text and back, on both sides; the hash blocks of 384 kB split
+# some of them further.
+echo "--- the slicer: the same lines as a sequential run"
+for t in t_text t_comp t_uuid t_ts t_num t_enum t_char t_bit t_dup; do
+	run "$t" 384kB 1 "3 3 4" -j 4 -split fixed -rows 1000
+	grep -q 'slicer: [0-9]* bounds' "$WORK/log" && pass "$t: $(grep -o 'slicer: [0-9]* bounds' "$WORK/log")" ||
+		{ fail "$t: the slicer did not run"; sed 's/^/    /' "$WORK/log"; }
+	same "$t" 384kB 256
+done
 B=$(sql "$D1" "SELECT array_length(histogram_bounds::text::text[], 1) FROM pg_stats WHERE tablename = 't_dup' AND attname = 'a'")
 D=$(sql "$D1" "SELECT count(DISTINCT b) FROM pg_stats, unnest(histogram_bounds::text::text[]) b WHERE tablename = 't_dup' AND attname = 'a'")
 "$BIN" -dsn1 "$D1" -dsn2 "$D2" -table t_dup -j 4 -out "$WORK/dup.out" >"$WORK/log" 2>&1 || true
-if [ "$D" -lt "$B" ] && grep -q "parallel: [0-9]* workers, $((D - 1)) key ranges" "$WORK/log"; then
+# The repeats are dropped: D-1 ranges. With fewer than 4 per worker, the
+# histogram is passed over for the slicer, and the log says so.
+if [ "$D" -ge "$B" ]; then
+	fail "t_dup: $B bounds, $D distinct: no repeated bound to drop"
+elif [ $((D - 1)) -ge 16 ] && grep -q "parallel: [0-9]* workers, $((D - 1)) key ranges" "$WORK/log"; then
 	pass "t_dup: $B histogram bounds, $D distinct, $((D - 1)) ranges"
+elif [ $((D - 1)) -lt 16 ] && grep -q "has $((D - 1)) bins, fewer than 4 per worker" "$WORK/log"; then
+	pass "t_dup: $B histogram bounds, $D distinct, $((D - 1)) bins: the slicer"
 else
 	fail "t_dup: $B bounds, $D distinct: $(grep 'parallel:' "$WORK/log")"
 fi
