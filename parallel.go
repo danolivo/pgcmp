@@ -54,62 +54,72 @@ func rangeList(rs []keyRange) rangeFeed {
 // its report lines to w.
 type rangeFunc func(ctx context.Context, ref, tst *side, r keyRange, w io.Writer) (stats, error)
 
-// runParallel compares the ranges of feed with up to workers pairs of
-// sessions; how one range is compared is up to the strategy (compare).
+// runParallel compares the ranges of split with split.workers(opt.jobs)
+// workers; how one range is compared is up to the strategy (compare).
 //
-// Each side exports the snapshot of its coordinator transaction, and every
-// worker imports it, so all sessions of one side see exactly the same data.
-// A worker is a pair of connections (reference + test) that takes ranges
-// one by one. The report comes out in range order (see orderedReport), so
-// the report of a range-ordered strategy stays ordered.
-func runParallel(ctx context.Context, opt *options, ref, tst *side, feed rangeFeed, workers int,
+// A worker is a pair of sessions (reference + test) that takes ranges one
+// by one. The coordinator pair, ref and tst, is one of the workers, so a
+// run with j workers needs j connections per server. It starts right away
+// when the ranges are a list; with a feed it starts once the feed has
+// returned, because the feed may read through the coordinator transaction
+// (see keySplit.feedHoldsCoordinator).
+//
+// The other workers import the snapshots of the coordinator transactions,
+// so all sessions of one side see exactly the same data. The report comes
+// out in range order (see orderedReport), so the report of a range-ordered
+// strategy stays ordered.
+func runParallel(ctx context.Context, opt *options, ref, tst *side, split keySplit,
 	compare rangeFunc, tmpDir string, w io.Writer) (stats, error) {
 
-	snap1, err := ref.exportSnapshot(ctx)
-	if err != nil {
-		return stats{}, err
-	}
-	snap2, err := tst.exportSnapshot(ctx)
-	if err != nil {
-		return stats{}, err
-	}
-
-	// Open all worker connections up front. If a server runs out of
-	// connection slots, go on with the workers that did connect: fewer
-	// workers is slower but still correct.
 	type pair struct{ ref, tst *side }
-	var pairs []pair
+	var pairs []pair // opened here: all workers but the coordinator
 	defer func() {
 		for _, p := range pairs {
 			p.ref.close()
 			p.tst.close()
 		}
 	}()
-	for len(pairs) < workers {
-		a, err := openSide(ctx, "reference", opt.dsn1, snap1)
-		if err == nil {
-			var b *side
-			if b, err = openSide(ctx, "test", opt.dsn2, snap2); err == nil {
-				pairs = append(pairs, pair{a, b})
-				continue
+	workers := split.workers(opt.jobs)
+	if workers > 1 {
+		snap1, err := ref.exportSnapshot(ctx)
+		if err != nil {
+			return stats{}, err
+		}
+		snap2, err := tst.exportSnapshot(ctx)
+		if err != nil {
+			return stats{}, err
+		}
+		// Open the connections up front. If a server runs out of
+		// connection slots, go on with the workers that did connect, the
+		// coordinator at least: fewer workers is slower but still correct.
+		for len(pairs) < workers-1 {
+			a, err := openSide(ctx, "reference", opt.dsn1, snap1)
+			if err == nil {
+				var b *side
+				if b, err = openSide(ctx, "test", opt.dsn2, snap2); err == nil {
+					pairs = append(pairs, pair{a, b})
+					continue
+				}
+				a.close()
 			}
-			a.close()
+			if isTooManyConnections(err) {
+				log.Printf("warning: only %d of %d workers could connect: %v", len(pairs)+1, workers, err)
+				break
+			}
+			return stats{}, err
 		}
-		if len(pairs) > 0 && isTooManyConnections(err) {
-			log.Printf("warning: only %d of %d workers could connect: %v", len(pairs), workers, err)
-			break
-		}
-		return stats{}, err
 	}
+	all := append(pairs[:len(pairs):len(pairs)], pair{ref, tst}) // the coordinator is the last worker
 
 	rep := newOrderedReport(tmpDir, w)
 	defer rep.cleanup()
-	err = forEachRange(ctx, feed, len(pairs), func(ctx context.Context, worker, seq int, r keyRange) error {
-		p := pairs[worker]
-		return rep.add(seq, func(w io.Writer) (stats, error) {
-			return compare(ctx, p.ref, p.tst, r, w)
+	err := forEachRange(ctx, split.source(), len(all), split.feedHoldsCoordinator(),
+		func(ctx context.Context, worker, seq int, r keyRange) error {
+			p := all[worker]
+			return rep.add(seq, func(w io.Writer) (stats, error) {
+				return compare(ctx, p.ref, p.tst, r, w)
+			})
 		})
-	})
 	if err != nil {
 		return stats{}, err
 	}
@@ -120,9 +130,16 @@ func runParallel(ctx context.Context, opt *options, ref, tst *side, feed rangeFe
 // numbered in the order the feed sends them, from 0; worker is the number
 // of the worker, from 0 to n-1, so that work can pick its sessions.
 //
+// The feed never waits for the workers: ranges it sends queue up without
+// limit, so it runs at its own pace and finishes as early as it can. A
+// range costs only its bounds in memory. With late, the last worker starts
+// only after the feed has returned, in the feed's own goroutine: it may
+// share the feed's sessions. Even a single late worker cannot deadlock,
+// since the feed never waits for it.
+//
 // The first error cancels the context of the feed and of all workers and is
-// returned; the feed may run ahead of the workers by a few ranges.
-func forEachRange(ctx context.Context, feed rangeFeed, n int,
+// returned.
+func forEachRange(ctx context.Context, feed rangeFeed, n int, late bool,
 	work func(ctx context.Context, worker, seq int, r keyRange) error) error {
 
 	if n < 1 {
@@ -133,21 +150,50 @@ func forEachRange(ctx context.Context, feed rangeFeed, n int,
 		r   keyRange
 	}
 	g, gctx := errgroup.WithContext(ctx)
-	ranges := make(chan keyRange, 4*n)
+	ranges := make(chan keyRange)
 	jobs := make(chan job)
 
+	loop := func(worker int) error {
+		for j := range jobs {
+			if err := work(gctx, worker, j.seq, j.r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	g.Go(func() error {
-		defer close(ranges)
-		return feed(gctx, ranges)
+		err := feed(gctx, ranges)
+		close(ranges)
+		if err != nil || !late {
+			return err
+		}
+		return loop(n - 1)
 	})
-	// Numbering happens in one goroutine, in the order of the feed; workers
-	// receive concurrently and could not agree on an order themselves.
+	// The queue: always ready to take the next range from the feed, and
+	// hands ranges out to the workers in feed order, numbering them. One
+	// goroutine numbers them: workers receive concurrently and could not
+	// agree on an order themselves.
 	g.Go(func() error {
 		defer close(jobs)
+		var queue []keyRange
 		seq := 0
-		for r := range ranges {
+		in := ranges
+		for in != nil || len(queue) > 0 {
+			var out chan<- job // nil, so never ready, while the queue is empty
+			var head job
+			if len(queue) > 0 {
+				out, head = jobs, job{seq, queue[0]}
+			}
 			select {
-			case jobs <- job{seq, r}:
+			case r, ok := <-in:
+				if !ok {
+					in = nil // the feed is done; hand out the rest
+					continue
+				}
+				queue = append(queue, r)
+			case out <- head:
+				queue[0] = keyRange{} // drop the bounds of a range handed out
+				queue = queue[1:]
 				seq++
 			case <-gctx.Done():
 				return gctx.Err()
@@ -155,15 +201,12 @@ func forEachRange(ctx context.Context, feed rangeFeed, n int,
 		}
 		return nil
 	})
-	for worker := range n {
-		g.Go(func() error {
-			for j := range jobs {
-				if err := work(gctx, worker, j.seq, j.r); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
+	early := n
+	if late {
+		early = n - 1
+	}
+	for worker := range early {
+		g.Go(func() error { return loop(worker) })
 	}
 	return g.Wait()
 }

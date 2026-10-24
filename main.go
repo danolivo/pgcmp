@@ -230,14 +230,14 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	defer f.Close()
 	w := bufio.NewWriterSize(f, 1<<20)
 
-	// 6. Compare: a single range known in advance in the coordinator
-	// sessions, anything else in workers (see keySplit.inCoordinator).
+	// 6. Compare: a single range known in advance right in the coordinator
+	// sessions, anything else in workers, the coordinator pair among them
+	// (see keySplit.inCoordinator).
 	var st stats
 	if split.inCoordinator() {
 		st, err = cmp.compareRange(ctx, ref, tst, split.ranges[0], w)
 	} else {
-		st, err = runParallel(ctx, opt, ref, tst, split.source(), split.workers(opt.jobs),
-			cmp.compareRange, filepath.Dir(opt.out), w)
+		st, err = runParallel(ctx, opt, ref, tst, split, cmp.compareRange, filepath.Dir(opt.out), w)
 	}
 	if err != nil {
 		return st, err

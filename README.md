@@ -161,7 +161,8 @@ be compared.
   from the list.
 * `-filter` — a `WHERE` expression, inserted as is on both sides.
 * `-j` — the number of parallel workers (1 by default). Each worker is
-  a pair of connections, so each server needs `j + 1` connections.
+  a pair of connections, one per server; the coordinator's own pair is one of
+  them, so each server needs `j` connections.
 * `-mem` — memory for one block of reference-side rows (by default
   `64MB`), for hash blocks only. Units as in PostgreSQL: `kB`, `MB`,
   `GB`, `TB` (powers of 1024); a number without a unit means megabytes. This is an estimate based on
@@ -247,8 +248,11 @@ gaps.
 
 * Both sides export the snapshot of the coordinator transaction
   (`pg_export_snapshot()`), and all workers import it — visibility within
-  each side is the same.
-* Ranges are handed to workers through a queue. A range with differences writes
+  each side is the same. The coordinator pair itself works as one of the `j`
+  workers.
+* Ranges are handed to workers through a queue with no limit: whatever cuts the
+  key space never waits for the workers, and a queued range costs only its
+  bounds in memory. A range with differences writes
   them to a temporary file next to `-out`; a range that matched writes nothing
   and leaves no file. As soon as all ranges before a range are done, its file is
   appended to the report and removed. So the report stays in range order, and
@@ -258,7 +262,8 @@ gaps.
 * No histogram (the table has not been analyzed) — a warning and
   a sequential run.
 * The server refused a connection because of `max_connections` — a warning,
-  and the work continues with the workers that managed to connect.
+  and the work continues with the workers that managed to connect, at least
+  the coordinator.
 
 ## What it does
 

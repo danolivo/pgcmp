@@ -83,15 +83,20 @@ type keySplit struct {
 }
 
 // inCoordinator reports whether the run compares one range right in the
-// coordinator sessions, with no workers. Only a single range known in
-// advance does. A feed may read through the coordinator transaction of the
-// reference side for the whole run (the slicer keeps its cursor open
-// there), and one connection runs one query at a time, so a fed run always
-// goes through workers, even with -j 1.
+// coordinator sessions, with no workers and no queue. Only a single range
+// known in advance does; anything else goes through runParallel, where the
+// coordinator pair is one of the workers.
 func (s keySplit) inCoordinator() bool { return s.feed == nil && len(s.ranges) == 1 }
 
-// workers is the number of worker pairs to open: no more than there are
-// ranges, when that is known.
+// feedHoldsCoordinator reports whether the ranges come from a feed that
+// reads through the coordinator transaction of the reference side (the
+// slicer keeps its cursor open there; a stored block map is read there).
+// One connection runs one query at a time, so the coordinator pair joins
+// the workers only once such a feed has returned.
+func (s keySplit) feedHoldsCoordinator() bool { return s.feed != nil }
+
+// workers is the number of workers, the coordinator pair included: no more
+// than there are ranges, when that is known.
 func (s keySplit) workers(jobs int) int {
 	if s.feed != nil {
 		return max(jobs, 1)

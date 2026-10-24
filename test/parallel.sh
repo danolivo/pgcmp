@@ -84,11 +84,17 @@ rc=0; run "$WORK/f4" -table big -j 4 -filter "id % 2 = 0" || rc=$?
 if cmp -s "$WORK/f1" "$WORK/f4"; then echo "ok   filtered reports are identical"; else
 	echo "FAIL filtered reports differ"; FAILED=1; fi
 
-# 100 ranges -> 100 workers -> 101 connections per server, more than the
+# 1000 ranges -> 500 workers -> 500 connections per server, more than the
 # default max_connections: pgcmp must go on with the workers that connected.
-echo "--- more workers than ranges and than connection slots"
+echo "--- more workers than connection slots"
+sql "$D1" "ALTER TABLE big ALTER id SET STATISTICS 1000"
+sql "$D1" "ANALYZE big"
 rc=0; run "$WORK/j500" -table big -j 500 || rc=$?; check "-j 500 finds differences" 1 $rc
 cmp -s "$WORK/j1" "$WORK/j500" && echo "ok   -j 500 report is identical" || { echo "FAIL -j 500"; FAILED=1; }
+grep -q "workers could connect" "$WORK/j500.log" \
+	&& echo "ok   -j 500 warns about connection slots" || { echo "FAIL -j 500: no warning"; FAILED=1; }
+sql "$D1" "ALTER TABLE big ALTER id SET STATISTICS -1"
+sql "$D1" "ANALYZE big"
 
 echo "--- no histogram: warning, sequential run"
 for D in "$D1" "$D2"; do

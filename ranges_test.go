@@ -67,21 +67,27 @@ func TestKeySplit(t *testing.T) {
 		s             keySplit
 		jobs          int
 		inCoordinator bool
-		workers       int
+		holds         bool // feedHoldsCoordinator
+		workers       int  // the coordinator pair included
 		planRanges    int
 	}{
-		{"sequential", keySplit{ranges: []keyRange{{}}}, 1, true, 1, 1},
-		{"no histogram, -j 4", keySplit{ranges: []keyRange{{}}}, 4, true, 1, 1},
-		{"histogram, -j 4", keySplit{ranges: histogramRanges([]string{"1", "5", "7", "9"})}, 4, false, 3, 3},
-		{"histogram, -j 2", keySplit{ranges: histogramRanges([]string{"1", "5", "7", "9"})}, 2, false, 2, 3},
-		// A feed may hold the coordinator transaction: workers even at -j 1,
-		// and the plan of the whole key space is checked.
-		{"feed, -j 1", keySplit{feed: feed}, 1, false, 1, 1},
-		{"feed, -j 8", keySplit{feed: feed}, 8, false, 8, 1},
+		{"sequential", keySplit{ranges: []keyRange{{}}}, 1, true, false, 1, 1},
+		{"no histogram, -j 4", keySplit{ranges: []keyRange{{}}}, 4, true, false, 1, 1},
+		{"histogram, -j 4", keySplit{ranges: histogramRanges([]string{"1", "5", "7", "9"})}, 4, false, false, 3, 3},
+		{"histogram, -j 2", keySplit{ranges: histogramRanges([]string{"1", "5", "7", "9"})}, 2, false, false, 2, 3},
+		// A feed holds the coordinator transaction until it returns, so it
+		// never runs in the coordinator alone: at -j 1 the coordinator pair
+		// is the one worker, after the feed. The plan of the whole key
+		// space is checked.
+		{"feed, -j 1", keySplit{feed: feed}, 1, false, true, 1, 1},
+		{"feed, -j 8", keySplit{feed: feed}, 8, false, true, 8, 1},
 	}
 	for _, c := range cases {
 		if got := c.s.inCoordinator(); got != c.inCoordinator {
 			t.Errorf("%s: inCoordinator = %v", c.name, got)
+		}
+		if got := c.s.feedHoldsCoordinator(); got != c.holds {
+			t.Errorf("%s: feedHoldsCoordinator = %v", c.name, got)
 		}
 		if got := c.s.workers(c.jobs); got != c.workers {
 			t.Errorf("%s: workers = %d, want %d", c.name, got, c.workers)
