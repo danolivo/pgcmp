@@ -18,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -190,23 +191,28 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 		log.Printf("ignored (present on one side only): %s", strings.Join(p.ignored, ", "))
 	}
 
-	// 3. Choose how rows are matched by key. Everything below goes through
-	// the strategy and does not depend on the choice.
-	cmp, err := newStrategy(ctx, opt, ref, d1, d2, p)
-	if err != nil {
-		return stats{}, err
-	}
+	// 3. Choose how rows are matched by key, and cut the key space into
+	// ranges for the workers. Everything below goes through the strategy
+	// and does not depend on either choice.
+	cmp := newStrategy(opt, d1, d2, p)
+	ranges := keyRanges(ctx, opt, ref, d1, p)
 	log.Printf("method: %s", cmp.name())
-	log.Printf("reference query: %s", cmp.query(0))
-	if q2 := cmp.query(1); q2 != cmp.query(0) {
+	q1, q2 := cmp.rangeQuery(0, keyRange{}), cmp.rangeQuery(1, keyRange{})
+	log.Printf("reference query: %s", q1)
+	if q2 != q1 {
 		log.Printf("test query: %s", q2)
 	}
 
-	// 4. Check that each side will read the rows in key order through the
-	// primary key index rather than scan and sort the table.
+	// 4. Check that each side will read the rows of every range in key
+	// order through the primary key index rather than scan and sort the
+	// table.
 	for i, s := range []*side{ref, tst} {
 		table := []*description{d1, d2}[i].qualifiedName()
-		w, err := s.checkPlans(ctx, table, cmp.planQueries(i))
+		queries := make([]string, len(ranges))
+		for j, r := range ranges {
+			queries[j] = cmp.rangeQuery(i, r)
+		}
+		w, err := s.checkPlans(ctx, table, queries)
 		if err != nil {
 			return stats{}, err
 		}
@@ -223,10 +229,19 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	defer f.Close()
 	w := bufio.NewWriterSize(f, 1<<20)
 
-	// 6. Compare.
-	st, err := cmp.run(ctx, ref, tst, w)
+	// 6. Compare: one range in the coordinator sessions, or several in
+	// parallel workers.
+	var st stats
+	if len(ranges) == 1 {
+		st, err = cmp.compareRange(ctx, ref, tst, ranges[0], w)
+	} else {
+		st, err = runParallel(ctx, opt, ref, tst, ranges, cmp.compareRange, filepath.Dir(opt.out), w)
+	}
 	if err != nil {
 		return st, err
+	}
+	if st.blocks > 0 {
+		log.Printf("blocks: %d", st.blocks)
 	}
 
 	if st.diffs() == 0 {

@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
-	"path/filepath"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -32,9 +30,10 @@ import (
 // reading it, the socket fills up and the server waits until the next
 // block. No cursor and no repeated index descents.
 //
-// With -j > 1 the key space is first cut into ranges on the first key
-// column, by its histogram on the reference side, and every range runs the
-// block loop above in its own pair of sessions.
+// The loop runs over one key range (ranges.go): the whole key space in a
+// sequential run, or one of the ranges parallel workers take in their own
+// pairs of sessions. The first block of a range has the lower end of the
+// range as its lower bound, and the last one its upper end.
 //
 // This relies on both servers ordering the key the same way, which the
 // plan check verifies indirectly: a key whose ordering does not match its
@@ -48,44 +47,16 @@ type hashStrategy struct {
 	p      *plan
 	filter string
 	mem    byteSize
-	ranges []textRange
 }
 
-// textRange is a half-open interval on the first key column,
-// lo <= k1 < hi, with the bounds as text; a nil bound is open.
-type textRange struct {
-	lo, hi *string
-}
-
-func newHashStrategy(ctx context.Context, opt *options, ref *side, d1, d2 *description, p *plan) *hashStrategy {
-	h := &hashStrategy{
+func newHashStrategy(opt *options, d1, d2 *description, p *plan) *hashStrategy {
+	return &hashStrategy{
 		opt:    opt,
 		tables: [2]string{d1.qualifiedName(), d2.qualifiedName()},
 		p:      p,
 		filter: strings.TrimSpace(opt.filter),
 		mem:    opt.blockMem,
-		ranges: []textRange{{}},
 	}
-	if opt.jobs > 1 {
-		k := p.key[0]
-		bounds, err := ref.histogramText(ctx, d1, k.name, k.base[0])
-		switch {
-		case err != nil:
-			log.Printf("warning: %v; running without parallelism", err)
-		case len(bounds) < 2:
-			log.Printf("warning: no histogram for %s.%s on the reference side (run ANALYZE); running without parallelism",
-				d1.qualifiedName(), k.name)
-		default:
-			lo, hi := splitBounds(bounds)
-			h.ranges = make([]textRange, len(lo))
-			for i := range lo {
-				h.ranges[i] = textRange{lo[i], hi[i]}
-			}
-			log.Printf("parallel: %d workers, %d key ranges from the histogram of %s",
-				min(opt.jobs, len(h.ranges)), len(h.ranges), k.name)
-		}
-	}
-	return h
 }
 
 func (h *hashStrategy) name() string {
@@ -104,27 +75,28 @@ func (h *hashStrategy) keyExpr(side int) string {
 	return "ROW(" + strings.Join(exprs, ", ") + ")::text"
 }
 
-// rangeConds restricts the first key column to range r on one side. The
-// bounds are inlined as literals of the column type of that side, so that
-// range queries can be planned and checked before the run.
-func (h *hashStrategy) rangeConds(side int, r textRange) []string {
-	k := h.p.key[0]
-	col := pgx.Identifier{k.name}.Sanitize()
-	lit := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'::" + k.base[side] }
-	var c []string
-	if r.lo != nil {
-		c = append(c, col+" >= "+lit(*r.lo))
+// keyCols are the quoted key columns, in key order.
+func (h *hashStrategy) keyCols() []string {
+	cols := make([]string, len(h.p.key))
+	for i, k := range h.p.key {
+		cols[i] = pgx.Identifier{k.name}.Sanitize()
 	}
-	if r.hi != nil {
-		c = append(c, col+" < "+lit(*r.hi))
-	}
-	return c
+	return cols
+}
+
+// rangeConds restricts the key to range r on one side. The ends are
+// inlined as literals of the key column types of that side, so that range
+// queries can be planned and checked before the run.
+func (h *hashStrategy) rangeConds(side int, r keyRange) []string {
+	return r.conditions(h.keyCols(), func(i int, v string) string {
+		return quoteLiteral(v) + "::" + h.p.key[i].base[side]
+	})
 }
 
 // refQuery reads range r of the reference side in key order: the key text,
 // each key column as text in its bound type (the block bounds), and the
 // row text.
-func (h *hashStrategy) refQuery(r textRange) string {
+func (h *hashStrategy) refQuery(r keyRange) string {
 	cols := []string{h.keyExpr(0)}
 	for _, k := range h.p.key {
 		cols = append(cols, pgx.Identifier{k.name}.Sanitize()+"::"+k.base[0]+"::text")
@@ -136,7 +108,7 @@ func (h *hashStrategy) refQuery(r textRange) string {
 // testQuery reads one block of range r on the test side: lo and hi say
 // whether the block has a lower (exclusive) and an upper (inclusive) bound.
 // The lower bound takes parameters $1..$n, the upper one the next n.
-func (h *hashStrategy) testQuery(r textRange, lo, hi bool) string {
+func (h *hashStrategy) testQuery(r keyRange, lo, hi bool) string {
 	conds := h.rangeConds(1, r)
 	next := 1
 	if lo {
@@ -149,20 +121,12 @@ func (h *hashStrategy) testQuery(r textRange, lo, hi bool) string {
 	return h.selectFrom(1, []string{h.keyExpr(1), rowExpr(h.p, 1)}, conds)
 }
 
-// bound compares the key with parameters $first.., each cast to the type
-// of its column on the test side. A composite key uses a row comparison,
-// which a btree index on the key serves directly.
+// bound compares the whole key with parameters $first.., each cast to the
+// type of its column on the test side.
 func (h *hashStrategy) bound(op string, first int) string {
-	cols := make([]string, len(h.p.key))
-	params := make([]string, len(h.p.key))
-	for i, k := range h.p.key {
-		cols[i] = pgx.Identifier{k.name}.Sanitize()
-		params[i] = fmt.Sprintf("$%d::%s", first+i, k.base[1])
-	}
-	if len(cols) == 1 {
-		return cols[0] + " " + op + " " + params[0]
-	}
-	return "(" + strings.Join(cols, ", ") + ") " + op + " (" + strings.Join(params, ", ") + ")"
+	return keyCondition(h.keyCols(), op, make([]string, len(h.p.key)), func(i int, _ string) string {
+		return fmt.Sprintf("$%d::%s", first+i, h.p.key[i].base[1])
+	})
 }
 
 func (h *hashStrategy) selectFrom(side int, cols, conds []string) string {
@@ -186,45 +150,19 @@ func (h *hashStrategy) selectFrom(side int, cols, conds []string) string {
 	return b.String()
 }
 
-func (h *hashStrategy) query(side int) string {
+// rangeQuery: on the test side, the query of the whole range. Block
+// bounds are parameters and are left out; if a range query reads the key
+// index, a block of it does too.
+func (h *hashStrategy) rangeQuery(side int, r keyRange) string {
 	if side == 0 {
-		return h.refQuery(textRange{})
+		return h.refQuery(r)
 	}
-	return h.testQuery(textRange{}, false, false)
+	return h.testQuery(r, false, false)
 }
 
-// planQueries: one query per range. Block bounds are parameters and are
-// left out; if a range query reads the key index, a block of it does too.
-func (h *hashStrategy) planQueries(side int) []string {
-	qs := make([]string, len(h.ranges))
-	for i, r := range h.ranges {
-		if side == 0 {
-			qs[i] = h.refQuery(r)
-		} else {
-			qs[i] = h.testQuery(r, false, false)
-		}
-	}
-	return qs
-}
-
-func (h *hashStrategy) run(ctx context.Context, ref, tst *side, w io.Writer) (stats, error) {
+// compareRange runs the block loop over range r in one pair of sessions.
+func (h *hashStrategy) compareRange(ctx context.Context, ref, tst *side, r keyRange, w io.Writer) (stats, error) {
 	var st stats
-	var err error
-	if len(h.ranges) == 1 {
-		st, err = h.compareRange(ctx, ref, tst, 0, w)
-	} else {
-		st, err = runParallel(ctx, h.opt, ref, tst, len(h.ranges), h.compareRange, filepath.Dir(h.opt.out), w)
-	}
-	if err == nil {
-		log.Printf("blocks: %d", st.blocks)
-	}
-	return st, err
-}
-
-// compareRange runs the block loop over range i in one pair of sessions.
-func (h *hashStrategy) compareRange(ctx context.Context, ref, tst *side, i int, w io.Writer) (stats, error) {
-	var st stats
-	r := h.ranges[i]
 	rows, err := ref.tx.Query(ctx, h.refQuery(r))
 	if err != nil {
 		return st, fmt.Errorf("%s: query: %w", ref.name, err)
@@ -292,7 +230,7 @@ func (h *hashStrategy) compareRange(ctx context.Context, ref, tst *side, i int, 
 
 // probe reads the test rows of block (lo, hi] in range r and matches them
 // against the block. A nil bound is open.
-func (h *hashStrategy) probe(ctx context.Context, tst *side, b *block, r textRange, lo, hi []string, w io.Writer, st *stats) error {
+func (h *hashStrategy) probe(ctx context.Context, tst *side, b *block, r keyRange, lo, hi []string, w io.Writer, st *stats) error {
 	args := make([]any, 0, len(lo)+len(hi))
 	for _, v := range lo {
 		args = append(args, v)

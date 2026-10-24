@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"strings"
 	"testing"
 )
 
@@ -109,7 +108,7 @@ func TestHashQueries(t *testing.T) {
 	}
 	h := &hashStrategy{tables: [2]string{`"public"."r"`, `"public"."t"`}, p: p, filter: "v <> ''"}
 
-	all := textRange{}
+	all := keyRange{}
 	got := h.refQuery(all)
 	want := `SELECT ROW("id"::bigint, "Name")::text, "id"::integer::text, "Name"::character varying::text, ROW("v")::text FROM "public"."r"` +
 		` WHERE (v <> '') ORDER BY "public"."r"."id", "public"."r"."Name"`
@@ -119,14 +118,15 @@ func TestHashQueries(t *testing.T) {
 
 	// A range restricts the first key column on both sides, in the column
 	// type of each side, with the bound quoted as a literal.
-	lo, hi := "1", "it's"
-	got = h.refQuery(textRange{&lo, &hi})
+	lo := keyBound{vals: []string{"1"}, inclusive: true}
+	hi := keyBound{vals: []string{"it's"}}
+	got = h.refQuery(keyRange{lo, hi})
 	want = `SELECT ROW("id"::bigint, "Name")::text, "id"::integer::text, "Name"::character varying::text, ROW("v")::text FROM "public"."r"` +
 		` WHERE (v <> '') AND "id" >= '1'::integer AND "id" < 'it''s'::integer ORDER BY "public"."r"."id", "public"."r"."Name"`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-	got = h.testQuery(textRange{lo: &lo}, true, true)
+	got = h.testQuery(keyRange{lo: lo}, true, true)
 	want = `SELECT ROW("id", "Name")::text, ROW("v")::text FROM "public"."t"` +
 		` WHERE (v <> '') AND "id" >= '1'::bigint AND ("id", "Name") > ($1::bigint, $2::text) AND ("id", "Name") <= ($3::bigint, $4::text)` +
 		` ORDER BY "public"."t"."id", "public"."t"."Name"`
@@ -157,40 +157,8 @@ func TestHashQueries(t *testing.T) {
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-	if got, want := h.query(1), `SELECT ROW("k")::text, '()'::text FROM "t" ORDER BY "t"."k"`; got != want {
+	if got, want := h.rangeQuery(1, all), `SELECT ROW("k")::text, '()'::text FROM "t" ORDER BY "t"."k"`; got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
-	}
-}
-
-func TestSplitBounds(t *testing.T) {
-	show := func(lo, hi []*string) string {
-		var parts []string
-		for i := range lo {
-			l, h := "-inf", "+inf"
-			if lo[i] != nil {
-				l = *lo[i]
-			}
-			if hi[i] != nil {
-				h = *hi[i]
-			}
-			parts = append(parts, "["+l+","+h+")")
-		}
-		return strings.Join(parts, " ")
-	}
-	cases := []struct {
-		bounds []string
-		want   string
-	}{
-		{nil, "[-inf,+inf)"},
-		{[]string{"m"}, "[-inf,+inf)"},
-		{[]string{"a", "z"}, "[-inf,+inf)"},
-		{[]string{"a", "m", "z"}, "[-inf,m) [m,+inf)"},
-		{[]string{"a", "f", "m", "z"}, "[-inf,f) [f,m) [m,+inf)"},
-	}
-	for _, c := range cases {
-		if got := show(splitBounds(c.bounds)); got != c.want {
-			t.Errorf("bounds %v: got %s, want %s", c.bounds, got, c.want)
-		}
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -515,9 +516,14 @@ func buildQuery(qualifiedTable string, p *plan, side int, filter string, r keyRa
 	if f := strings.TrimSpace(filter); f != "" {
 		conds = append(conds, "("+f+")")
 	}
-	if c := r.condition(pk); c != "" {
-		conds = append(conds, c)
-	}
+	// The bounds come from the server as integers and are inlined as they
+	// are; anything else would be quoted and cast, never inlined raw.
+	conds = append(conds, r.conditions([]string{pk}, func(_ int, v string) string {
+		if _, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return v
+		}
+		return quoteLiteral(v) + "::" + p.key[0].base[side]
+	})...)
 	if len(conds) > 0 {
 		fmt.Fprintf(&b, " WHERE %s", strings.Join(conds, " AND "))
 	}
