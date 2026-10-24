@@ -25,6 +25,12 @@ go build
 go test
 ```
 
+CI (`.github/workflows/tests.yml`) runs on every pull request and every
+push to `main`: `gofmt`, `go vet` and the unit tests with `-race`; the
+scripts on local clusters below (every `test/*.sh` but `regress.sh`) on
+PostgreSQL 16, 17 and 18; and the regression suite on two instances
+(`regress.sh`).
+
 Regression suite on two instances (needs Docker; ~2 minutes, the first
 run takes ~12 minutes to build the image):
 

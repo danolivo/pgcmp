@@ -1,0 +1,98 @@
+name: tests
+
+# Every pull request, every push to main (a merge included), and by hand.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the run of the previous one; runs on
+# main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  unit:
+    name: gofmt, go vet, unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt-ed: $unformatted"
+            exit 1
+          fi
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  # The scripts start two throwaway clusters on local ports and need initdb,
+  # pg_ctl and psql of one server version in PATH.
+  integration:
+    name: integration, PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: install PostgreSQL ${{ matrix.pg }}
+        run: |
+          # The scripts make their own clusters; the package's default one
+          # is not needed.
+          echo 'create_main_cluster = false' | sudo tee -a /etc/postgresql-common/createcluster.conf
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y -qq postgresql-${{ matrix.pg }}
+          echo "/usr/lib/postgresql/${{ matrix.pg }}/bin" >> "$GITHUB_PATH"
+      - run: initdb --version
+      # Every script on local clusters, so that a new one is picked up
+      # without touching this file; regress.sh has a job of its own.
+      - name: test/*.sh
+        run: |
+          failed=""
+          for t in test/*.sh; do
+            [ "$t" = test/regress.sh ] && continue
+            echo "::group::$t"
+            "$t" || failed="$failed $t"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::failed:$failed"
+            exit 1
+          fi
+
+  # The PostgreSQL regression database on two instances in Docker, checked
+  # against an independent oracle. The image with the compiled suite is
+  # built from scratch on every run, so this is the slow job.
+  regress:
+    name: regression database, two instances
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      IMAGE: postgres:18
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: install psql
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y -qq postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+      - run: test/regress.sh
