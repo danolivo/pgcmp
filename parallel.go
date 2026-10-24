@@ -170,17 +170,18 @@ func forEachRange(ctx context.Context, feed rangeFeed, n int,
 
 // orderedReport puts together the reports of ranges compared out of order.
 //
-// Each range writes its report to a temporary file in dir. As soon as all
-// ranges before it are done, the file is appended to w and removed, so
-// only ranges that finished ahead of a slower predecessor wait on disk,
-// however many ranges there are.
+// A range that finds differences writes them to a temporary file in dir;
+// a range that matches writes nothing and leaves no file. As soon as all
+// ranges before a range are done, its file is appended to w and removed,
+// so only ranges with differences that finished ahead of a slower
+// predecessor wait on disk.
 type orderedReport struct {
 	dir string
 
 	mu    sync.Mutex
 	w     io.Writer
 	next  int            // first range not yet appended to w
-	ready map[int]string // finished ranges waiting for a predecessor: their files
+	ready map[int]string // finished ranges waiting for a predecessor: their files, "" if none
 	total stats
 }
 
@@ -192,27 +193,17 @@ func newOrderedReport(dir string, w io.Writer) *orderedReport {
 // appends to w every report that is now in order. Each seq must be added
 // once; add may be called from several goroutines.
 func (o *orderedReport) add(seq int, compare func(w io.Writer) (stats, error)) error {
-	f, err := os.CreateTemp(o.dir, ".pgcmp-*.part")
+	lf := &lazyFile{dir: o.dir}
+	st, err := compare(lf)
+	path, err := lf.finish(err)
 	if err != nil {
-		return fmt.Errorf("create temporary report: %w", err)
-	}
-	bw := bufio.NewWriter(f)
-	st, err := compare(bw)
-	if err == nil {
-		err = bw.Flush()
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		os.Remove(f.Name())
 		return err
 	}
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.total.add(st)
-	o.ready[seq] = f.Name()
+	o.ready[seq] = path
 	for {
 		path, ok := o.ready[o.next]
 		if !ok {
@@ -220,10 +211,52 @@ func (o *orderedReport) add(seq int, compare func(w io.Writer) (stats, error)) e
 		}
 		delete(o.ready, o.next)
 		o.next++
+		if path == "" {
+			continue
+		}
 		if err := appendFile(o.w, path); err != nil {
 			return err
 		}
 	}
+}
+
+// lazyFile is the report of one range. It becomes a temporary file only
+// when the first line is written, so a range that matched costs no file.
+type lazyFile struct {
+	dir string
+	f   *os.File
+	bw  *bufio.Writer
+}
+
+func (l *lazyFile) Write(p []byte) (int, error) {
+	if l.f == nil {
+		f, err := os.CreateTemp(l.dir, ".pgcmp-*.part")
+		if err != nil {
+			return 0, fmt.Errorf("create temporary report: %w", err)
+		}
+		l.f, l.bw = f, bufio.NewWriter(f)
+	}
+	return l.bw.Write(p)
+}
+
+// finish flushes and closes the file and returns its path, or "" if
+// nothing was written. err is the error of the comparison: with it, or
+// with an error of its own, the file is removed and the error returned.
+func (l *lazyFile) finish(err error) (string, error) {
+	if l.f == nil {
+		return "", err
+	}
+	if err == nil {
+		err = l.bw.Flush()
+	}
+	if cerr := l.f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(l.f.Name())
+		return "", err
+	}
+	return l.f.Name(), nil
 }
 
 // finish returns the total of all ranges once every one has been added.
@@ -242,7 +275,9 @@ func (o *orderedReport) cleanup() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for _, path := range o.ready {
-		os.Remove(path)
+		if path != "" {
+			os.Remove(path)
+		}
 	}
 	clear(o.ready)
 }

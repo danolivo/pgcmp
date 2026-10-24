@@ -248,11 +248,11 @@ gaps.
 * Both sides export the snapshot of the coordinator transaction
   (`pg_export_snapshot()`), and all workers import it — visibility within
   each side is the same.
-* Ranges are handed to workers through a queue; each one writes its report to a
-  temporary file next to `-out`, and as soon as all ranges before it are done, the
-  file is appended to the report and removed. So the report stays in range order,
-  and only the ranges that finished ahead of a slower one wait on disk, however
-  many ranges there are. For merge, the report stays sorted by key and
+* Ranges are handed to workers through a queue. A range with differences writes
+  them to a temporary file next to `-out`; a range that matched writes nothing
+  and leaves no file. As soon as all ranges before a range are done, its file is
+  appended to the report and removed. So the report stays in range order, and
+  only ranges with differences that finished ahead of a slower one wait on disk. For merge, the report stays sorted by key and
   matches the report of a sequential run; for hash blocks the
   set of lines matches, and the order is as with a different `-mem`.
 * No histogram (the table has not been analyzed) — a warning and
