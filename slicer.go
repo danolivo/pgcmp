@@ -209,22 +209,15 @@ func rowsForWidth(mem byteSize, width float64) int {
 	return int(min(max(n, minSliceRows), maxSliceRows))
 }
 
-// sliceRows decides N: -rows if given; otherwise an estimate from -mem
-// and the average width of a row on the reference side: the sum of
-// pg_stats.avg_width over the compared columns and the key, or, without
-// statistics, the table size per row. It returns N and how it was chosen,
-// for the log.
-func sliceRows(ctx context.Context, opt *options, ref *side, d *description, p *plan) (int, string, error) {
-	if opt.blockRows > 0 {
-		return opt.blockRows, "from -rows", nil
+// sliceRows decides N: rows if given (-rows); otherwise an estimate from
+// mem (-mem) and the average width of a row of the table on side s: the
+// sum of pg_stats.avg_width over cols, or, without statistics, the table
+// size per row. It returns N and how it was chosen, for the log.
+func sliceRows(ctx context.Context, s *side, d *description, cols []string, rows int, mem byteSize) (int, string, error) {
+	if rows > 0 {
+		return rows, "from -rows", nil
 	}
-	cols := make([]string, 0, len(p.key)+len(p.cols))
-	for _, k := range p.key {
-		cols = append(cols, k.name)
-	}
-	for _, c := range p.cols {
-		cols = append(cols, c.name)
-	}
+	ref := s
 	var width *float64
 	var tuples float64
 	var size int64
@@ -240,30 +233,33 @@ func sliceRows(ctx context.Context, opt *options, ref *side, d *description, p *
 	}
 	switch {
 	case width != nil:
-		return rowsForWidth(opt.blockMem, *width), fmt.Sprintf("estimated from -mem %s and the average row width, %.0f bytes", opt.blockMem, *width), nil
+		return rowsForWidth(mem, *width), fmt.Sprintf("estimated from -mem %s and the average row width, %.0f bytes", mem, *width), nil
 	case tuples > 0:
 		w := float64(size) / tuples
-		return rowsForWidth(opt.blockMem, w), fmt.Sprintf("estimated from -mem %s and the table size per row, %.0f bytes", opt.blockMem, w), nil
+		return rowsForWidth(mem, w), fmt.Sprintf("estimated from -mem %s and the table size per row, %.0f bytes", mem, w), nil
 	}
 	return defaultSliceRows, "by default: the table has never been analysed", nil
 }
 
-// newSlicer prepares the slicer of the reference table for a run.
-func newSlicer(ctx context.Context, opt *options, ref *side, d *description, p *plan, workers int) (*slicer, string, error) {
+// newSlicer prepares the slicer of a table on side s. cols are the
+// columns whose width estimates N when rows is 0; maxBatch limits the
+// MOVE/FETCH pairs of one round trip.
+func newSlicer(ctx context.Context, s *side, d *description, cols []string, filter string,
+	rows int, mem byteSize, maxBatch int) (*slicer, string, error) {
 	key, err := keyOf(d)
 	if err != nil {
 		return nil, "", err
 	}
-	rows, how, err := sliceRows(ctx, opt, ref, d, p)
+	n, how, err := sliceRows(ctx, s, d, cols, rows, mem)
 	if err != nil {
 		return nil, "", err
 	}
 	return &slicer{
 		table:    d.qualifiedName(),
 		key:      key,
-		filter:   opt.filter,
-		rows:     rows,
-		maxBatch: 4 * max(workers, 1),
+		filter:   filter,
+		rows:     n,
+		maxBatch: maxBatch,
 	}, how, nil
 }
 

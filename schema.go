@@ -196,8 +196,10 @@ func connect(ctx context.Context, name, dsn string) (*side, error) {
 		encoding: conn.PgConn().ParameterStatus("server_encoding"),
 		version:  conn.PgConn().ParameterStatus("server_version"),
 	}
-	// Simple protocol on purpose: several statements in one round trip.
-	if _, err := conn.PgConn().Exec(ctx, sessionSetup).ReadAll(); err != nil {
+	// Simple protocol on purpose: several statements in one round trip. The
+	// application name tells the sessions apart in pg_stat_activity.
+	setup := sessionSetup + "SET application_name = " + quoteLiteral("pgcmp "+name) + ";"
+	if _, err := conn.PgConn().Exec(ctx, setup).ReadAll(); err != nil {
 		s.close()
 		return nil, fmt.Errorf("%s: session setup: %w", name, err)
 	}
