@@ -157,6 +157,41 @@ func TestForEachRangeCancel(t *testing.T) {
 	}
 }
 
+// Matched ranges waiting for a slow predecessor leave nothing on disk;
+// only a range with differences keeps a file until its turn.
+func TestOrderedReportMatchedRangesNoFiles(t *testing.T) {
+	dir := t.TempDir()
+	var out bytes.Buffer
+	rep := newOrderedReport(dir, &out)
+	matched := func(io.Writer) (stats, error) { return stats{rows1: 10, rows2: 10}, nil }
+	for seq := 1; seq <= 100; seq++ {
+		if err := rep.add(seq, matched); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertEmptyDir(t, dir)
+	if err := rep.add(101, func(w io.Writer) (stats, error) {
+		_, err := io.WriteString(w, "101 (a) (b)\n")
+		return stats{differ: 1}, err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := os.ReadDir(dir); len(left) != 1 {
+		t.Fatalf("%d files waiting, want 1 (the range with differences)", len(left))
+	}
+	if err := rep.add(0, matched); err != nil { // the slow one
+		t.Fatal(err)
+	}
+	st, err := rep.finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "101 (a) (b)\n" || st.rows1 != 1010 || st.differ != 1 {
+		t.Fatalf("report %q, stats %+v", out.String(), st)
+	}
+	assertEmptyDir(t, dir)
+}
+
 // After an error, nothing is left on disk: neither the report of the range
 // that failed nor those that waited for a predecessor.
 func TestOrderedReportCleanup(t *testing.T) {
