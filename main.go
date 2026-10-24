@@ -13,6 +13,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -86,46 +87,89 @@ func main() {
 	os.Exit(run())
 }
 
+const usage = `usage: pgcmp -dsn1 <dsn> -dsn2 <dsn> -table <name> [-columns a,b,c] [-filter <expr>] [-j N] [-mem size] [-rows N] [-out <file>]
+       pgcmp slice -dsn <dsn> -table <name> -map <table> [-rows N] [-mem size] [-filter <expr>] [-replace]`
+
+// The first argument picks the command: "slice" builds a block map, and
+// anything else is a comparison, as before there were commands.
 func run() int {
 	log.SetFlags(0)
 	log.SetPrefix("pgcmp: ")
+	if args := os.Args[1:]; len(args) > 0 && args[0] == "slice" {
+		return runSlice(args[1:])
+	}
+	return runCompare(os.Args[1:])
+}
 
+// usageError is a command line that parsed but makes no sense; the flag
+// package reports the errors of parsing itself.
+type usageError string
+
+func (e usageError) Error() string { return string(e) }
+
+// parseFailed reports a command line error and returns the exit code: 0
+// for -h, which the flag package has answered already.
+func parseFailed(err error) int {
+	if errors.Is(err, flag.ErrHelp) {
+		return exitMatch
+	}
+	var ue usageError
+	if errors.As(err, &ue) {
+		fmt.Fprintf(os.Stderr, "pgcmp: %v\n%s\n", ue, usage)
+	}
+	return exitError
+}
+
+// signalContext is cancelled on Ctrl-C or SIGTERM.
+func signalContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
+
+func parseCompare(args []string) (*options, error) {
+	fs := flag.NewFlagSet("pgcmp", flag.ContinueOnError)
 	var opt options
 	var cols string
-	flag.StringVar(&opt.dsn1, "dsn1", "", "connection string of the reference instance")
-	flag.StringVar(&opt.dsn2, "dsn2", "", "connection string of the instance under test")
-	flag.StringVar(&opt.table, "table", "", "table name, optionally schema-qualified")
-	flag.StringVar(&cols, "columns", "", "comma-separated columns to compare (default: columns present on both sides)")
-	flag.StringVar(&opt.filter, "filter", "", "WHERE expression applied on both sides")
-	flag.StringVar(&opt.out, "out", "pgcmp.out", "report file")
-	flag.IntVar(&opt.jobs, "j", 1, "parallel workers; key ranges come from the reference histogram of the (first) key column")
+	fs.StringVar(&opt.dsn1, "dsn1", "", "connection string of the reference instance")
+	fs.StringVar(&opt.dsn2, "dsn2", "", "connection string of the instance under test")
+	fs.StringVar(&opt.table, "table", "", "table name, optionally schema-qualified")
+	fs.StringVar(&cols, "columns", "", "comma-separated columns to compare (default: columns present on both sides)")
+	fs.StringVar(&opt.filter, "filter", "", "WHERE expression applied on both sides")
+	fs.StringVar(&opt.out, "out", "pgcmp.out", "report file")
+	fs.IntVar(&opt.jobs, "j", 1, "parallel workers; key ranges come from the reference histogram of the (first) key column")
 	opt.blockMem = 64 << 20
-	flag.Var(&opt.blockMem, "mem", "memory for one block of reference rows, e.g. 64MB or 512kB; a bare number is MB (keys other than a single integer column)")
-	flag.IntVar(&opt.blockRows, "rows", 0, "at most this many reference rows in one block, 0 = no limit; with -mem, whichever is reached first closes the block (keys other than a single integer column)")
-	flag.Parse()
-
-	// Parsing stops at the first non-flag argument; everything after it
-	// (including any further -flags) lands in flag.Args() unparsed.
-	if flag.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "pgcmp: unexpected arguments: %q\n", flag.Args())
-		flag.Usage()
-		return exitError
+	fs.Var(&opt.blockMem, "mem", "memory for one block of reference rows, e.g. 64MB or 512kB; a bare number is MB (keys other than a single integer column)")
+	fs.IntVar(&opt.blockRows, "rows", 0, "at most this many reference rows in one block, 0 = no limit; with -mem, whichever is reached first closes the block (keys other than a single integer column)")
+	if err := fs.Parse(args); err != nil {
+		return nil, err
 	}
-
-	if opt.dsn1 == "" || opt.dsn2 == "" || opt.table == "" || opt.jobs < 1 || opt.blockRows < 0 {
-		fmt.Fprintln(os.Stderr, "usage: pgcmp -dsn1 <dsn> -dsn2 <dsn> -table <name> [-columns a,b,c] [-filter <expr>] [-j N] [-mem size] [-rows N] [-out <file>]")
-		return exitError
+	// Parsing stops at the first non-flag argument; everything after it
+	// (including any further -flags) lands in fs.Args() unparsed.
+	if fs.NArg() > 0 {
+		return nil, usageError(fmt.Sprintf("unexpected arguments: %q", fs.Args()))
+	}
+	if opt.dsn1 == "" || opt.dsn2 == "" || opt.table == "" {
+		return nil, usageError("-dsn1, -dsn2 and -table are required")
+	}
+	if opt.jobs < 1 || opt.blockRows < 0 {
+		return nil, usageError("-j must be at least 1 and -rows at least 0")
 	}
 	for _, c := range strings.Split(cols, ",") {
 		if c = strings.TrimSpace(c); c != "" {
 			opt.columns = append(opt.columns, c)
 		}
 	}
+	return &opt, nil
+}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+func runCompare(args []string) int {
+	opt, err := parseCompare(args)
+	if err != nil {
+		return parseFailed(err)
+	}
+	ctx, stop := signalContext()
 	defer stop()
 
-	st, err := compare(ctx, &opt)
+	st, err := compare(ctx, opt)
 	if err != nil {
 		log.Printf("error: %v", err)
 		return exitError

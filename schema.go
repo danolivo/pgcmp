@@ -167,10 +167,24 @@ func (p *plan) isKey(name string) bool {
 // as a format_type string, or an error if there is none.
 type commonTypeFunc func(c1, c2 column) (string, error)
 
-// openSide connects, applies the session settings and opens a read-only
-// REPEATABLE READ transaction. A non-empty snapshot is an exported snapshot
-// id: the transaction then sees exactly what the exporting one sees.
+// openSide connects and opens the read-only REPEATABLE READ transaction
+// every reading session works in (see connect and begin).
 func openSide(ctx context.Context, name, dsn, snapshot string) (*side, error) {
+	s, err := connect(ctx, name, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.begin(ctx, snapshot); err != nil {
+		s.close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// connect opens a session and applies the session settings, with no
+// transaction: a session that writes (the one that stores a block map)
+// starts its own.
+func connect(ctx context.Context, name, dsn string) (*side, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%s: connect: %w", name, err)
@@ -187,23 +201,29 @@ func openSide(ctx context.Context, name, dsn, snapshot string) (*side, error) {
 		s.close()
 		return nil, fmt.Errorf("%s: session setup: %w", name, err)
 	}
-	// One snapshot per side for the whole run: catalog lookups and the data
-	// stream see the same state. REPEATABLE READ also allows exporting the
-	// snapshot later, for parallel range workers.
-	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	return s, nil
+}
+
+// begin opens the read-only REPEATABLE READ transaction of the session. A
+// non-empty snapshot is an exported snapshot id: the transaction then sees
+// exactly what the exporting one sees.
+//
+// One snapshot per side for the whole run: catalog lookups and the data
+// stream see the same state. REPEATABLE READ also allows exporting the
+// snapshot later, for parallel range workers.
+func (s *side) begin(ctx context.Context, snapshot string) error {
+	tx, err := s.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		s.close()
-		return nil, fmt.Errorf("%s: begin: %w", name, err)
+		return fmt.Errorf("%s: begin: %w", s.name, err)
 	}
 	s.tx = tx
 	if snapshot != "" {
-		sql := "SET TRANSACTION SNAPSHOT '" + strings.ReplaceAll(snapshot, "'", "''") + "'"
+		sql := "SET TRANSACTION SNAPSHOT " + quoteLiteral(snapshot)
 		if _, err := tx.Exec(ctx, sql); err != nil {
-			s.close()
-			return nil, fmt.Errorf("%s: import snapshot: %w", name, err)
+			return fmt.Errorf("%s: import snapshot: %w", s.name, err)
 		}
 	}
-	return s, nil
+	return nil
 }
 
 func (s *side) close() {
@@ -355,33 +375,36 @@ func (s *side) commonType(ctx context.Context, c1, c2 column) (string, error) {
 // int2/int4/int8 column on both sides sets intKey: such a key is compared
 // as an integer and needs no casts.
 func negotiate(d1, d2 *description, requested []string, common commonTypeFunc) (*plan, error) {
-	for _, d := range []*description{d1, d2} {
-		if len(d.pk) == 0 {
-			return nil, fmt.Errorf("%s: %s has no primary key", d.side, d.qualifiedName())
-		}
+	key1, err := keyOf(d1)
+	if err != nil {
+		return nil, err
+	}
+	key2, err := keyOf(d2)
+	if err != nil {
+		return nil, err
 	}
 	if keyList(d1.pk) != keyList(d2.pk) {
 		return nil, fmt.Errorf("primary key differs: (%s) (reference) vs (%s) (test)", keyList(d1.pk), keyList(d2.pk))
 	}
 
 	p := &plan{intKey: len(d1.pk) == 1 && integerTypes[d1.pk[0].typeOID] && integerTypes[d2.pk[0].typeOID]}
-	for i := range d1.pk {
+	for i := range key1 {
 		k := keyCol{
-			colPlan: colPlan{name: d1.pk[i].name},
-			base:    [2]string{d1.pk[i].baseType, d2.pk[i].baseType},
+			colPlan: colPlan{name: key1[i].name},
+			base:    [2]string{key1[i].baseType, key2[i].baseType},
 		}
 		if !p.intKey {
-			cp, err := castPlan(d1.pk[i], d2.pk[i], common)
+			cp, err := castPlan(key1[i].column, key2[i].column, common)
 			if err != nil {
 				return nil, fmt.Errorf("primary key column %q: %w", k.name, err)
 			}
 			k.colPlan = cp
-			for side, c := range []column{d1.pk[i], d2.pk[i]} {
-				if alt, ok := unambiguousKeyType[c.typeOID]; ok {
-					k.base[side] = alt
-					if k.cast[side] == "" {
-						k.cast[side] = alt
-					}
+			for side, kc := range []keyColumn{key1[i], key2[i]} {
+				k.base[side] = kc.bound
+				// The key text goes through the sibling as well, unless
+				// the column is cast to a common type anyway.
+				if kc.bound != kc.baseType && k.cast[side] == "" {
+					k.cast[side] = kc.bound
 				}
 			}
 		}
@@ -448,6 +471,34 @@ func negotiate(d1, d2 *description, requested []string, common commonTypeFunc) (
 var unambiguousKeyType = map[uint32]string{
 	24:   "regprocedure", // regproc
 	2203: "regoperator",  // regoper
+}
+
+// keyColumn is one primary key column as its own server sees it.
+type keyColumn struct {
+	column
+	// bound is the type the values of the column are written in and read
+	// back as on its own server, as range bounds and as key text: the
+	// column type without its modifier, or the unambiguous sibling of a
+	// type whose text does not identify the value (unambiguousKeyType).
+	bound string
+}
+
+// keyOf returns the primary key of the table as its own server sees it, in
+// index order. That is all cutting the key space on one server needs, with
+// no other side involved (pgcmp slice); negotiate builds the plan of the
+// two sides on top of it.
+func keyOf(d *description) ([]keyColumn, error) {
+	if len(d.pk) == 0 {
+		return nil, fmt.Errorf("%s: %s has no primary key", d.side, d.qualifiedName())
+	}
+	key := make([]keyColumn, len(d.pk))
+	for i, c := range d.pk {
+		key[i] = keyColumn{column: c, bound: c.baseType}
+		if alt, ok := unambiguousKeyType[c.typeOID]; ok {
+			key[i].bound = alt
+		}
+	}
+	return key, nil
 }
 
 // keyList returns the key column names, comma-separated, for messages and
