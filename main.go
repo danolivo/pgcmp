@@ -195,7 +195,7 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	// ranges for the workers. Everything below goes through the strategy
 	// and does not depend on either choice.
 	cmp := newStrategy(opt, d1, d2, p)
-	ranges := keyRanges(ctx, opt, ref, d1, p)
+	split := splitKeys(ctx, opt, ref, d1, p)
 	log.Printf("method: %s", cmp.name())
 	q1, q2 := cmp.rangeQuery(0, keyRange{}), cmp.rangeQuery(1, keyRange{})
 	log.Printf("reference query: %s", q1)
@@ -208,8 +208,9 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	// table.
 	for i, s := range []*side{ref, tst} {
 		table := []*description{d1, d2}[i].qualifiedName()
-		queries := make([]string, len(ranges))
-		for j, r := range ranges {
+		planRanges := split.planRanges()
+		queries := make([]string, len(planRanges))
+		for j, r := range planRanges {
 			queries[j] = cmp.rangeQuery(i, r)
 		}
 		w, err := s.checkPlans(ctx, table, queries)
@@ -229,13 +230,13 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	defer f.Close()
 	w := bufio.NewWriterSize(f, 1<<20)
 
-	// 6. Compare: one range in the coordinator sessions, or several in
-	// parallel workers.
+	// 6. Compare: a single range known in advance in the coordinator
+	// sessions, anything else in workers (see keySplit.inCoordinator).
 	var st stats
-	if len(ranges) == 1 {
-		st, err = cmp.compareRange(ctx, ref, tst, ranges[0], w)
+	if split.inCoordinator() {
+		st, err = cmp.compareRange(ctx, ref, tst, split.ranges[0], w)
 	} else {
-		st, err = runParallel(ctx, opt, ref, tst, rangeList(ranges), min(opt.jobs, len(ranges)),
+		st, err = runParallel(ctx, opt, ref, tst, split.source(), split.workers(opt.jobs),
 			cmp.compareRange, filepath.Dir(opt.out), w)
 	}
 	if err != nil {
