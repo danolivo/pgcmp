@@ -3,44 +3,25 @@ package main
 import (
 	"context"
 	"io"
-	"log"
-	"path/filepath"
 	"strconv"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // mergeStrategy compares tables with a single integer key: both sides
-// stream in key order and the streams are merged on the client. With -j > 1
-// the key space is split by the histogram of the reference side.
+// stream in key order and the streams are merged on the client.
 type mergeStrategy struct {
 	opt    *options
 	tables [2]string
 	p      *plan
-	ranges []keyRange
 }
 
-func newMergeStrategy(ctx context.Context, opt *options, ref *side, d1, d2 *description, p *plan) (*mergeStrategy, error) {
-	m := &mergeStrategy{
+func newMergeStrategy(opt *options, d1, d2 *description, p *plan) *mergeStrategy {
+	return &mergeStrategy{
 		opt:    opt,
 		tables: [2]string{d1.qualifiedName(), d2.qualifiedName()},
 		p:      p,
-		ranges: []keyRange{{}},
 	}
-	if opt.jobs > 1 {
-		pk := p.key[0].name
-		bounds, err := ref.histogram(ctx, d1, pk)
-		if err != nil {
-			return nil, err
-		}
-		if len(bounds) < 2 {
-			log.Printf("warning: no histogram for %s.%s on the reference side (run ANALYZE); running without parallelism",
-				d1.qualifiedName(), pk)
-		} else {
-			m.ranges = rangesFromBounds(bounds)
-			log.Printf("parallel: %d workers, %d key ranges from the histogram",
-				min(opt.jobs, len(m.ranges)), len(m.ranges))
-		}
-	}
-	return m, nil
 }
 
 func (m *mergeStrategy) name() string { return "merge by integer key" }
@@ -49,24 +30,30 @@ func (m *mergeStrategy) rangeQuery(side int, r keyRange) string {
 	return buildQuery(m.tables[side], m.p, side, m.opt.filter, r)
 }
 
-func (m *mergeStrategy) query(side int) string { return m.rangeQuery(side, keyRange{}) }
-
-func (m *mergeStrategy) planQueries(side int) []string {
-	qs := make([]string, len(m.ranges))
-	for i, r := range m.ranges {
-		qs[i] = m.rangeQuery(side, r)
-	}
-	return qs
+func (m *mergeStrategy) compareRange(ctx context.Context, ref, tst *side, r keyRange, w io.Writer) (stats, error) {
+	return runRange(ctx, ref, tst, m.rangeQuery(0, r), m.rangeQuery(1, r), w)
 }
 
-func (m *mergeStrategy) run(ctx context.Context, ref, tst *side, w io.Writer) (stats, error) {
-	if len(m.ranges) == 1 {
-		return runRange(ctx, ref, tst, m.rangeQuery(0, m.ranges[0]), m.rangeQuery(1, m.ranges[0]), w)
-	}
-	return runParallel(ctx, m.opt, ref, tst, len(m.ranges),
-		func(ctx context.Context, ref, tst *side, i int, w io.Writer) (stats, error) {
-			return runRange(ctx, ref, tst, m.rangeQuery(0, m.ranges[i]), m.rangeQuery(1, m.ranges[i]), w)
-		}, filepath.Dir(m.opt.out), w)
+// runRange streams both sides concurrently and merges them.
+//
+// errgroup cancels gctx as soon as any of the three goroutines fails;
+// readers blocked on a full channel then wake up and exit. Wait returns the
+// first error, which is the real cause.
+func runRange(ctx context.Context, ref, tst *side, q1, q2 string, w io.Writer) (stats, error) {
+	g, gctx := errgroup.WithContext(ctx)
+	ch1 := make(chan row, bufferRows)
+	ch2 := make(chan row, bufferRows)
+	var st stats
+
+	g.Go(func() error { return ref.stream(gctx, q1, ch1) })
+	g.Go(func() error { return tst.stream(gctx, q2, ch2) })
+	g.Go(func() error {
+		var err error
+		st, err = merge(ch1, ch2, w)
+		return err
+	})
+	err := g.Wait()
+	return st, err
 }
 
 // merge consumes two key-ordered streams and writes one report line per

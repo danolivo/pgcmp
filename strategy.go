@@ -6,35 +6,33 @@ import (
 	"io"
 )
 
-// strategy matches the rows of the two sides by primary key. compare()
-// picks one right after the key has been negotiated (newStrategy); the rest
-// of the program does not know which one runs.
+// strategy matches the rows of the two sides by primary key within one key
+// range (ranges.go). compare() picks one right after the key has been
+// negotiated (newStrategy); the rest of the program does not know which
+// one runs, and the strategy does not know how the key space was cut.
 //
 //   - mergeStrategy: one int2/int4/int8 key column. Both sides stream in key
-//     order and are merged on the client; parallel ranges come from the
-//     histogram.
+//     order and are merged on the client.
 //   - hashStrategy: any other key. Blocks of the reference side are hashed
 //     by the key text; each block is matched against the same key range of
-//     the test side. The client never orders keys. Parallel ranges come
-//     from the histogram of the first key column.
+//     the test side. The client never orders keys.
 type strategy interface {
 	// name is shown in the log.
 	name() string
-	// query is the query of one side (0 = reference, 1 = test) over the
-	// whole key space, for the log.
-	query(side int) string
-	// planQueries are the queries of one side whose plans are checked
-	// before the run.
-	planQueries(side int) []string
-	// run compares the two sides and writes one report line per mismatch.
-	run(ctx context.Context, ref, tst *side, w io.Writer) (stats, error)
+	// rangeQuery is the query of one side (0 = reference, 1 = test) over
+	// key range r. It is shown in the log (for the whole key space) and its
+	// plan is checked before the run.
+	rangeQuery(side int, r keyRange) string
+	// compareRange compares key range r in the given pair of sessions and
+	// writes one report line per mismatch to w.
+	compareRange(ctx context.Context, ref, tst *side, r keyRange, w io.Writer) (stats, error)
 }
 
-func newStrategy(ctx context.Context, opt *options, ref *side, d1, d2 *description, p *plan) (strategy, error) {
+func newStrategy(opt *options, d1, d2 *description, p *plan) strategy {
 	if p.intKey {
-		return newMergeStrategy(ctx, opt, ref, d1, d2, p)
+		return newMergeStrategy(opt, d1, d2, p)
 	}
-	return newHashStrategy(ctx, opt, ref, d1, d2, p), nil
+	return newHashStrategy(opt, d1, d2, p)
 }
 
 type stats struct {
@@ -42,7 +40,7 @@ type stats struct {
 	differ       uint64 // same key, different row text
 	onlyLeft     uint64 // key present only on the reference side
 	onlyRight    uint64 // key present only on the test side
-	blocks       uint64 // hash strategy: blocks compared
+	blocks       uint64 // hash strategy: blocks compared; 0 for merge
 }
 
 func (s stats) diffs() uint64 { return s.differ + s.onlyLeft + s.onlyRight }
