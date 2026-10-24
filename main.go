@@ -235,7 +235,8 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	if len(ranges) == 1 {
 		st, err = cmp.compareRange(ctx, ref, tst, ranges[0], w)
 	} else {
-		st, err = runParallel(ctx, opt, ref, tst, ranges, cmp.compareRange, filepath.Dir(opt.out), w)
+		st, err = runParallel(ctx, opt, ref, tst, rangeList(ranges), min(opt.jobs, len(ranges)),
+			cmp.compareRange, filepath.Dir(opt.out), w)
 	}
 	if err != nil {
 		return st, err
