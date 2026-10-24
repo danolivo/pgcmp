@@ -44,8 +44,9 @@ type options struct {
 	filter     string
 	out        string
 	jobs       int
-	blockMem   byteSize // hash strategy: memory for one block of reference rows
-	blockRows  int      // hash strategy: rows in one block; 0 = limited by blockMem only
+	split      string   // how to cut the key space for the workers: splitHistogram, splitFixed, splitNone
+	blockMem   byteSize // memory for one hash block of reference rows; estimates the rows of a slicer block
+	blockRows  int      // rows in one hash block and in one slicer block; 0 = limited by blockMem only
 }
 
 // byteSize is a -mem value: a number with an optional PostgreSQL-style
@@ -135,10 +136,11 @@ func parseCompare(args []string) (*options, error) {
 	fs.StringVar(&cols, "columns", "", "comma-separated columns to compare (default: columns present on both sides)")
 	fs.StringVar(&opt.filter, "filter", "", "WHERE expression applied on both sides")
 	fs.StringVar(&opt.out, "out", "pgcmp.out", "report file")
-	fs.IntVar(&opt.jobs, "j", 1, "parallel workers; key ranges come from the reference histogram of the (first) key column")
+	fs.IntVar(&opt.jobs, "j", 1, "parallel workers; the coordinator's own pair of connections is one of them")
+	fs.StringVar(&opt.split, "split", splitHistogram, "how to cut the key space, by priority: histogram (the histogram of the first key column; the slicer if it cannot be used), fixed (the slicer: blocks of -rows rows, in an index scan), none (one range)")
 	opt.blockMem = 64 << 20
-	fs.Var(&opt.blockMem, "mem", "memory for one block of reference rows, e.g. 64MB or 512kB; a bare number is MB (keys other than a single integer column)")
-	fs.IntVar(&opt.blockRows, "rows", 0, "at most this many reference rows in one block, 0 = no limit; with -mem, whichever is reached first closes the block (keys other than a single integer column)")
+	fs.Var(&opt.blockMem, "mem", "memory for one block of reference rows, e.g. 64MB or 512kB; a bare number is MB; without -rows, also sets the rows of a slicer block")
+	fs.IntVar(&opt.blockRows, "rows", 0, "at most this many reference rows in one block, 0 = no limit; with -mem, whichever is reached first closes the block; with the slicer, the rows of a block")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -152,6 +154,11 @@ func parseCompare(args []string) (*options, error) {
 	}
 	if opt.jobs < 1 || opt.blockRows < 0 {
 		return nil, usageError("-j must be at least 1 and -rows at least 0")
+	}
+	switch opt.split {
+	case splitHistogram, splitFixed, splitNone:
+	default:
+		return nil, usageError(fmt.Sprintf("-split %q: want histogram, fixed or none", opt.split))
 	}
 	for _, c := range strings.Split(cols, ",") {
 		if c = strings.TrimSpace(c); c != "" {
@@ -239,7 +246,10 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	// ranges for the workers. Everything below goes through the strategy
 	// and does not depend on either choice.
 	cmp := newStrategy(opt, d1, d2, p)
-	split := splitKeys(ctx, opt, ref, d1, p)
+	split, err := splitKeys(ctx, opt, ref, d1, p)
+	if err != nil {
+		return stats{}, err
+	}
 	log.Printf("method: %s", cmp.name())
 	q1, q2 := cmp.rangeQuery(0, keyRange{}), cmp.rangeQuery(1, keyRange{})
 	log.Printf("reference query: %s", q1)
@@ -258,6 +268,17 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 			queries[j] = cmp.rangeQuery(i, r)
 		}
 		w, err := s.checkPlans(ctx, table, queries)
+		if err != nil {
+			return stats{}, err
+		}
+		if w != "" {
+			log.Print(w)
+		}
+	}
+	// The slicer walks the key index of the reference table once; it is
+	// not forced to, only warned about.
+	if split.slicer != nil {
+		w, err := split.slicer.checkPlan(ctx, ref)
 		if err != nil {
 			return stats{}, err
 		}

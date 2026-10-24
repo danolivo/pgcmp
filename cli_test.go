@@ -26,8 +26,14 @@ func TestParseCompare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if opt.jobs != 4 || len(opt.columns) != 2 || opt.columns[1] != "y" || opt.blockMem != 64<<20 || opt.out != "pgcmp.out" {
+	if opt.jobs != 4 || len(opt.columns) != 2 || opt.columns[1] != "y" || opt.blockMem != 64<<20 || opt.out != "pgcmp.out" ||
+		opt.split != splitHistogram {
 		t.Fatalf("options: %+v", opt)
+	}
+	for _, v := range []string{splitHistogram, splitFixed, splitNone} {
+		if opt, err := quietParse(t, parseCompare, "-dsn1", "a", "-dsn2", "b", "-table", "t", "-split", v); err != nil || opt.split != v {
+			t.Errorf("-split %s: %v", v, err)
+		}
 	}
 
 	var ue usageError
@@ -35,6 +41,7 @@ func TestParseCompare(t *testing.T) {
 		{"-dsn1", "a", "-table", "t"},                                // no -dsn2
 		{"-dsn1", "a", "-dsn2", "b", "-table", "t", "-j", "0"},       // no workers
 		{"-dsn1", "a", "-dsn2", "b", "-table", "t", "extra", "-j=2"}, // stray argument
+		{"-dsn1", "a", "-dsn2", "b", "-table", "t", "-split", "index"},
 	} {
 		if _, err := quietParse(t, parseCompare, args...); !errors.As(err, &ue) {
 			t.Errorf("%q: got %v, want a usage error", args, err)

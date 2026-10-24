@@ -84,8 +84,10 @@ rc=0; run "$WORK/f4" -table big -j 4 -filter "id % 2 = 0" || rc=$?
 if cmp -s "$WORK/f1" "$WORK/f4"; then echo "ok   filtered reports are identical"; else
 	echo "FAIL filtered reports differ"; FAILED=1; fi
 
-# 1000 ranges -> 500 workers -> 500 connections per server, more than the
-# default max_connections: pgcmp must go on with the workers that connected.
+# 500 workers -> 500 connections per server, more than the default
+# max_connections: pgcmp must go on with the workers that connected. The
+# 1000 bins of the histogram are fewer than 4 per worker, so the slicer
+# cuts the key space.
 echo "--- more workers than connection slots"
 sql "$D1" "ALTER TABLE big ALTER id SET STATISTICS 1000"
 sql "$D1" "ANALYZE big"
@@ -93,16 +95,18 @@ rc=0; run "$WORK/j500" -table big -j 500 || rc=$?; check "-j 500 finds differenc
 cmp -s "$WORK/j1" "$WORK/j500" && echo "ok   -j 500 report is identical" || { echo "FAIL -j 500"; FAILED=1; }
 grep -q "workers could connect" "$WORK/j500.log" \
 	&& echo "ok   -j 500 warns about connection slots" || { echo "FAIL -j 500: no warning"; FAILED=1; }
+grep -q "fewer than 4 per worker" "$WORK/j500.log" \
+	&& echo "ok   -j 500: the slicer, for want of bins" || { echo "FAIL -j 500: the histogram was used"; FAILED=1; }
 sql "$D1" "ALTER TABLE big ALTER id SET STATISTICS -1"
 sql "$D1" "ANALYZE big"
 
-echo "--- no histogram: warning, sequential run"
+echo "--- no histogram: the slicer"
 for D in "$D1" "$D2"; do
 	sql "$D" "CREATE TABLE nohist (id int PRIMARY KEY, v text)"
 	sql "$D" "INSERT INTO nohist SELECT g, g::text FROM generate_series(1, 1000) g"
 done
 rc=0; run "$WORK/nh" -table nohist -j 4 || rc=$?; check "no histogram: match" 0 $rc
-grep -q "no histogram" "$WORK/nh.log" && echo "ok   warning printed" || { echo "FAIL no warning"; FAILED=1; }
+grep -q "no histogram" "$WORK/nh.log" && grep -q "slicer: " "$WORK/nh.log" && echo "ok   the slicer, and why" || { echo "FAIL no slicer"; FAILED=1; }
 
 echo "--- plan check: index usable, no warning"
 if grep -h "sequential scan" "$WORK/j1.log" "$WORK/j4.log"; then
