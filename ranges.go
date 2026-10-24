@@ -74,12 +74,55 @@ func quoteLiteral(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-// keyRanges cuts the key space for opt.jobs workers. A sequential run gets
+// keySplit is how the key space is cut for one run: either a list of
+// ranges known before the run, or a feed that cuts the key space while the
+// workers compare.
+type keySplit struct {
+	ranges []keyRange // known in advance; nil with a feed
+	feed   rangeFeed  // cuts during the run; nil with a list
+}
+
+// inCoordinator reports whether the run compares one range right in the
+// coordinator sessions, with no workers. Only a single range known in
+// advance does. A feed may read through the coordinator transaction of the
+// reference side for the whole run (the slicer keeps its cursor open
+// there), and one connection runs one query at a time, so a fed run always
+// goes through workers, even with -j 1.
+func (s keySplit) inCoordinator() bool { return s.feed == nil && len(s.ranges) == 1 }
+
+// workers is the number of worker pairs to open: no more than there are
+// ranges, when that is known.
+func (s keySplit) workers(jobs int) int {
+	if s.feed != nil {
+		return max(jobs, 1)
+	}
+	return min(jobs, len(s.ranges))
+}
+
+// source feeds the ranges to the workers.
+func (s keySplit) source() rangeFeed {
+	if s.feed != nil {
+		return s.feed
+	}
+	return rangeList(s.ranges)
+}
+
+// planRanges are the ranges whose queries are checked with EXPLAIN before
+// the run: all of them when they are known, or else the whole key space,
+// which has the same plan shape as any range without its bounds.
+func (s keySplit) planRanges() []keyRange {
+	if s.feed != nil {
+		return []keyRange{{}}
+	}
+	return s.ranges
+}
+
+// splitKeys cuts the key space for opt.jobs workers. A sequential run gets
 // one range, the whole key space. Otherwise the ranges come from the
 // histogram of the first key column on the reference side (see
 // histogramRanges); without a usable histogram the run is sequential.
-func keyRanges(ctx context.Context, opt *options, ref *side, d *description, p *plan) []keyRange {
-	whole := []keyRange{{}}
+func splitKeys(ctx context.Context, opt *options, ref *side, d *description, p *plan) keySplit {
+	whole := keySplit{ranges: []keyRange{{}}}
 	if opt.jobs <= 1 {
 		return whole
 	}
@@ -97,7 +140,7 @@ func keyRanges(ctx context.Context, opt *options, ref *side, d *description, p *
 	rs := histogramRanges(bounds)
 	log.Printf("parallel: %d workers, %d key ranges from the histogram of %s",
 		min(opt.jobs, len(rs)), len(rs), k.name)
-	return rs
+	return keySplit{ranges: rs}
 }
 
 // histogramRanges turns histogram bounds b0 < b1 < ... < bk of the first
