@@ -45,6 +45,8 @@ type options struct {
 	out        string
 	jobs       int
 	split      string   // how to cut the key space for the workers: splitHistogram, splitFixed, splitNone
+	splitSet   bool     // -split was given explicitly
+	mapName    string   // a block map to cut the key space by (pgcmp slice), instead of -split
 	blockMem   byteSize // memory for one hash block of reference rows; estimates the rows of a slicer block
 	blockRows  int      // rows in one hash block and in one slicer block; 0 = limited by blockMem only
 }
@@ -88,7 +90,7 @@ func main() {
 	os.Exit(run())
 }
 
-const usage = `usage: pgcmp -dsn1 <dsn> -dsn2 <dsn> -table <name> [-columns a,b,c] [-filter <expr>] [-j N] [-mem size] [-rows N] [-out <file>]
+const usage = `usage: pgcmp -dsn1 <dsn> -dsn2 <dsn> -table <name> [-columns a,b,c] [-filter <expr>] [-j N] [-split histogram|fixed|none | -map <table>] [-mem size] [-rows N] [-out <file>]
        pgcmp slice -dsn <dsn> -table <name> -map <table> [-rows N] [-mem size] [-filter <expr>] [-replace]`
 
 // The first argument picks the command: "slice" builds a block map, and
@@ -138,12 +140,14 @@ func parseCompare(args []string) (*options, error) {
 	fs.StringVar(&opt.out, "out", "pgcmp.out", "report file")
 	fs.IntVar(&opt.jobs, "j", 1, "parallel workers; the coordinator's own pair of connections is one of them")
 	fs.StringVar(&opt.split, "split", splitHistogram, "how to cut the key space, by priority: histogram (the histogram of the first key column; the slicer if it cannot be used), fixed (the slicer: blocks of -rows rows, in an index scan), none (one range)")
+	fs.StringVar(&opt.mapName, "map", "", "a block map built by pgcmp slice on the reference side: its blocks cut the key space, instead of -split")
 	opt.blockMem = 64 << 20
 	fs.Var(&opt.blockMem, "mem", "memory for one block of reference rows, e.g. 64MB or 512kB; a bare number is MB; without -rows, also sets the rows of a slicer block")
 	fs.IntVar(&opt.blockRows, "rows", 0, "at most this many reference rows in one block, 0 = no limit; with -mem, whichever is reached first closes the block; with the slicer, the rows of a block")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
+	fs.Visit(func(f *flag.Flag) { opt.splitSet = opt.splitSet || f.Name == "split" })
 	// Parsing stops at the first non-flag argument; everything after it
 	// (including any further -flags) lands in fs.Args() unparsed.
 	if fs.NArg() > 0 {

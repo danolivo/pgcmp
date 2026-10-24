@@ -154,6 +154,19 @@ inside a block, a `regproc` key, a filter that keeps 1 % of the rows (the
 blocks are counted over those), a table never analysed; which way `-split`
 takes and why; the warning when the slicer cannot walk the index.
 
+Block maps (same setup, local clusters):
+
+```sh
+test/map.sh            # ROWS=100000 by default
+```
+
+A map must cut exactly as the slicer of a comparison does (the `-map` report
+is the `-split fixed` report), count its rows right, appear whole or not at
+all (a slicer session killed in the middle of the pass leaves neither a map
+nor a temporary table), never overwrite without `-replace` nor drop anything
+but a map, and be refused when it does not fit the comparison (another key,
+another filter) or is broken (a gap, a missing tail).
+
 ## Usage
 
 ```sh
@@ -163,7 +176,7 @@ takes and why; the warning when the slicer cannot walk the index.
         [-columns id,amount,status] \
         [-filter "status <> 'archived'"] \
         [-j 4] \
-        [-split histogram|fixed|none] \
+        [-split histogram|fixed|none | -map maps.orders] \
         [-mem 64MB] \
         [-rows 3000] \
         [-out orders.diff]
@@ -185,6 +198,8 @@ takes and why; the warning when the slicer cannot walk the index.
   "Parallel mode"): `histogram` (by default) — the histogram of the first key
   column, or the slicer if the histogram cannot be used; `fixed` — the slicer,
   blocks of a fixed number of rows; `none` — one range, no parallelism.
+* `-map` — a block map built by `pgcmp slice` on the reference side (see
+  "Block maps"): its blocks cut the key space instead of `-split`.
 * `-mem` — memory for one block of reference-side rows (by default
   `64MB`), for hash blocks; without `-rows`, it also sets the rows of a slicer
   block. Units as in PostgreSQL: `kB`, `MB`,
@@ -346,6 +361,58 @@ MOVE FORWARD <N-1> IN pgcmp_slice; FETCH FORWARD 1 FROM pgcmp_slice;   -- per bo
 * The server refused a connection because of `max_connections` — a warning,
   and the work continues with the workers that managed to connect, at least
   the coordinator.
+
+## Block maps
+
+`pgcmp slice` cuts a table into blocks, as the slicer of a comparison does,
+and stores the cut in a table on the same server, without hashing anything:
+
+```sh
+./pgcmp slice -dsn 'host=n1 dbname=db user=u' \
+              -table public.orders \
+              -map maps.orders \
+              [-rows 100000 | -mem 64MB] \
+              [-filter "status <> 'archived'"] \
+              [-replace]
+```
+
+```sql
+seq   bigint NOT NULL   -- block number, from 0, in key order
+lo    text[]            -- lower bound, excluded; NULL: open
+hi    text[]            -- upper bound, included; NULL: open
+rows  bigint NOT NULL   -- rows in the block when the map was built
+hash  bytea             -- NULL; room for a block hash, filled in later
+```
+
+* The bounds hold one element per key column, as text of the column type on
+  that server (`regprocedure` for `regproc`, as in the comparison).
+* `rows` is N for every block but the last; the rest is counted at the end,
+  by an index scan of the tail only, in the same snapshot.
+* The comment on the table holds what the map was built from, as JSON: the
+  table, the key columns and their types, N, `-filter`, the snapshot
+  (`pg_current_snapshot()`), the server version, the time, the number of
+  blocks and rows, the revision of pgcmp.
+* Two sessions: the slicer reads in a read-only `REPEATABLE READ`
+  transaction (the snapshot of the map), the writer copies the blocks as they
+  come into a temporary table, then creates the map in one transaction:
+  `[DROP TABLE]`, `CREATE TABLE`, `INSERT … SELECT` from the temporary table,
+  a unique index on `seq`, the comment. The map appears whole or not at all;
+  after the commit, it is counted against what was cut.
+* An existing table is an error without `-replace`, and `-replace` drops a
+  block map only, never another table. The rights to create a table in the
+  schema and a temporary table in the database are checked before the pass.
+* Exit codes: `0` — the map is built, `2` — an error.
+
+`pgcmp -map maps.orders` then takes the blocks from the map, read in the
+coordinator transaction of the reference side, instead of cutting the table
+again (`-split` is ignored, with a warning). The map must fit the comparison:
+the same key columns with the same types on the reference side, and the same
+`-filter`; otherwise the comparison is refused before it starts. A map from
+an older snapshot is still correct — its blocks cover the whole key space with
+no gaps or overlaps — only a block may no longer hold N rows; a hash block
+still never takes more than `-mem`. The blocks are checked as they are read:
+numbered from 0, each starting at the bound the previous one ended at, the
+last one open; a broken or incomplete map stops the comparison with an error.
 
 ## What it does
 

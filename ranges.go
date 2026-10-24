@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -145,6 +146,9 @@ const minBinsPerWorker = 4
 //   - fixed: the slicer, with any number of workers;
 //   - none: one range.
 func splitKeys(ctx context.Context, opt *options, ref *side, d *description, p *plan) (keySplit, error) {
+	if opt.mapName != "" {
+		return mapSplit(ctx, opt, ref, d)
+	}
 	switch {
 	case opt.split == splitNone, opt.split == splitHistogram && opt.jobs <= 1:
 		return keySplit{ranges: []keyRange{{}}}, nil
@@ -185,11 +189,45 @@ func usableHistogram(ctx context.Context, opt *options, ref *side, d *descriptio
 	return rs, ""
 }
 
+// mapSplit cuts the key space by the blocks of a map stored on the
+// reference side (pgcmp slice), read through the coordinator transaction.
+func mapSplit(ctx context.Context, opt *options, ref *side, d *description) (keySplit, error) {
+	if opt.splitSet {
+		log.Printf("warning: -split is ignored: the blocks come from -map %s", opt.mapName)
+	}
+	m, table, err := ref.mapMetaOf(ctx, ref.tx, opt.mapName)
+	if err != nil {
+		return keySplit{}, err
+	}
+	key, err := keyOf(d)
+	if err != nil {
+		return keySplit{}, err
+	}
+	if err := m.compatible(key, opt.filter); err != nil {
+		return keySplit{}, fmt.Errorf("-map %s: %w", table, err)
+	}
+	if m.Table != d.qualifiedName() {
+		log.Printf("warning: -map %s was cut on %s, the reference table is %s", table, m.Table, d.qualifiedName())
+	}
+	workers := max(opt.jobs, 1)
+	log.Printf("parallel: %d workers, %d blocks of %d rows from the block map %s, cut %s ago",
+		workers, m.Blocks, m.Rows, table, time.Since(m.Built).Round(time.Second))
+	return keySplit{feed: mapFeed(ref, table, m.Blocks)}, nil
+}
+
 // sliceSplit cuts the key space with the slicer; why, if not empty, says
 // why the histogram was passed over.
 func sliceSplit(ctx context.Context, opt *options, ref *side, d *description, p *plan, why string) (keySplit, error) {
 	workers := max(opt.jobs, 1)
-	s, how, err := newSlicer(ctx, opt, ref, d, p, workers)
+	// The width of a block row: the key and the compared columns.
+	cols := make([]string, 0, len(p.key)+len(p.cols))
+	for _, k := range p.key {
+		cols = append(cols, k.name)
+	}
+	for _, c := range p.cols {
+		cols = append(cols, c.name)
+	}
+	s, how, err := newSlicer(ctx, ref, d, cols, opt.filter, opt.blockRows, opt.blockMem, 4*workers)
 	if err != nil {
 		return keySplit{}, err
 	}
