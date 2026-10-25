@@ -290,11 +290,14 @@ and the last one open on the right, so rows outside stale statistics
 are not lost. Ranges are half-open (`lo <= k1 < hi`), with no overlaps or
 gaps.
 
-The histogram cannot be used, and the slicer cuts instead, when: there is
-none (the table has not been analysed); it cannot be read (a type that cannot
-read its own text, `regproc`); `-filter` is set (the histogram describes the
-whole table, not the rows that match); or it has fewer than 4 bins per worker
-(uneven bins would leave workers idle at the end).
+The histogram is not used, and the slicer cuts instead, when: there is
+none (the table has not been analysed); the key type does not let it be read
+(an array, whose bounds do not parse as the element type, or `regproc` and
+`regoper`, whose text does not identify the value), so it is not even asked
+for; `-filter` is set (the histogram describes the whole table, not the rows
+that match); or it has fewer than 4 bins per worker (uneven bins would leave
+workers idle at the end). Any other failure to read the histogram stops the
+run with an error: `-split fixed` cuts the key space without it.
 
 * `histogram_bounds` has type `anyarray`: it cannot be cast,
   unnested or subscripted. So the histogram is parsed through
