@@ -104,6 +104,7 @@ type column struct {
 	typeOID  uint32
 	typeName string // format_type(atttypid, atttypmod), e.g. numeric(10,2)
 	baseType string // format_type(atttypid, -1), e.g. numeric; see describe
+	category string // pg_type.typcategory, e.g. "A" for an array
 }
 
 // description is what one side knows about the table.
@@ -281,8 +282,10 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 	rows, err := s.tx.Query(ctx, `
 		SELECT a.attname, a.atttypid,
 		       pg_catalog.format_type(a.atttypid, a.atttypmod),
-		       pg_catalog.format_type(a.atttypid, -1)
+		       pg_catalog.format_type(a.atttypid, -1),
+		       t.typcategory::text
 		FROM pg_catalog.pg_attribute a
+		JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
 		WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
 		ORDER BY a.attnum`, d.oid)
 	if err != nil {
@@ -290,7 +293,7 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 	}
 	d.columns, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (column, error) {
 		var c column
-		err := r.Scan(&c.name, &c.typeOID, &c.typeName, &c.baseType)
+		err := r.Scan(&c.name, &c.typeOID, &c.typeName, &c.baseType, &c.category)
 		return c, err
 	})
 	if err != nil {
@@ -342,20 +345,14 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 // s must be the side c1 came from; types are matched across the servers by
 // name only.
 func (s *side) commonType(ctx context.Context, c1, c2 column) (string, error) {
-	// Preparing may fail ("UNION types ... cannot be matched"); do it under a
-	// savepoint so that the failure does not abort the whole transaction.
-	sp, err := s.tx.Begin(ctx)
-	if err != nil {
-		return "", err
-	}
+	// Preparing fails when there is no common type ("UNION types ... cannot
+	// be matched"). That aborts the transaction, and the run with it: the
+	// caller stops at the first such column, and the user fixes it and
+	// starts again.
 	sql := fmt.Sprintf("SELECT x FROM (SELECT NULL::%s UNION ALL SELECT NULL::%s) s(x)",
 		c1.typeName, c2.typeName)
 	sd, err := s.conn.PgConn().Prepare(ctx, "", sql, nil)
 	if err != nil {
-		_ = sp.Rollback(ctx)
-		return "", err
-	}
-	if err := sp.Commit(ctx); err != nil {
 		return "", err
 	}
 
@@ -428,7 +425,11 @@ func negotiate(d1, d2 *description, requested []string, common commonTypeFunc) (
 		}
 	}
 
+	// Missing columns are found without asking a server, so all of them are
+	// reported at once. Common types are asked for only then, column by
+	// column: the first that has none fails the run (see commonType).
 	var problems []string
+	var pairs [][2]column
 	seen := map[string]bool{}
 	for _, name := range requested {
 		if seen[name] || p.isKey(name) {
@@ -440,24 +441,23 @@ func negotiate(d1, d2 *description, requested []string, common commonTypeFunc) (
 		switch {
 		case !ok1 && !ok2:
 			problems = append(problems, fmt.Sprintf("column %q exists on neither side", name))
-			continue
 		case !ok1:
 			problems = append(problems, fmt.Sprintf("column %q is missing on the reference side", name))
-			continue
 		case !ok2:
 			problems = append(problems, fmt.Sprintf("column %q is missing on the test side", name))
-			continue
+		default:
+			pairs = append(pairs, [2]column{c1, c2})
 		}
-
-		cp, err := castPlan(c1, c2, common)
-		if err != nil {
-			problems = append(problems, fmt.Sprintf("column %q: %v", name, err))
-			continue
-		}
-		p.cols = append(p.cols, cp)
 	}
 	if len(problems) > 0 {
 		return nil, fmt.Errorf("table structures do not match:\n  %s", strings.Join(problems, "\n  "))
+	}
+	for _, pair := range pairs {
+		cp, err := castPlan(pair[0], pair[1], common)
+		if err != nil {
+			return nil, fmt.Errorf("table structures do not match: column %q: %w", pair[0].name, err)
+		}
+		p.cols = append(p.cols, cp)
 	}
 	return p, nil
 }

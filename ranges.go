@@ -155,7 +155,10 @@ func splitKeys(ctx context.Context, opt *options, ref *side, d *description, p *
 	case opt.split == splitFixed:
 		return sliceSplit(ctx, opt, ref, d, p, "")
 	}
-	rs, why := usableHistogram(ctx, opt, ref, d, p)
+	rs, why, err := usableHistogram(ctx, opt, ref, d, p)
+	if err != nil {
+		return keySplit{}, err
+	}
 	if why != "" {
 		return sliceSplit(ctx, opt, ref, d, p, why)
 	}
@@ -165,28 +168,32 @@ func splitKeys(ctx context.Context, opt *options, ref *side, d *description, p *
 }
 
 // usableHistogram returns the ranges of the histogram of the first key
-// column, or why the histogram cannot be used: there is none (the table
-// has not been analysed), it cannot be read, -filter is set (the histogram
-// describes the whole table, not the rows that match), or it has fewer
-// than minBinsPerWorker bins per worker.
-func usableHistogram(ctx context.Context, opt *options, ref *side, d *description, p *plan) ([]keyRange, string) {
+// column, or why the histogram is not used: -filter is set (the histogram
+// describes the whole table, not the rows that match), the key type does
+// not let it be read (histogramUnreadable), there is none (the table has
+// not been analysed), or it has fewer than minBinsPerWorker bins per
+// worker. Any other failure to read it is an error: the run stops there.
+func usableHistogram(ctx context.Context, opt *options, ref *side, d *description, p *plan) ([]keyRange, string, error) {
 	k := p.key[0]
 	if strings.TrimSpace(opt.filter) != "" {
-		return nil, "-filter is set, and the histogram describes the whole table"
+		return nil, "-filter is set, and the histogram describes the whole table", nil
+	}
+	if why := histogramUnreadable(d.pk[0]); why != "" {
+		return nil, why, nil
 	}
 	bounds, err := ref.histogram(ctx, d, k.name, k.base[0])
 	switch {
 	case err != nil:
-		return nil, err.Error()
+		return nil, "", fmt.Errorf("%w; -split fixed cuts the key space without the histogram", err)
 	case len(bounds) < 2:
-		return nil, fmt.Sprintf("no histogram for %s.%s on the reference side", d.qualifiedName(), k.name)
+		return nil, fmt.Sprintf("no histogram for %s.%s on the reference side", d.qualifiedName(), k.name), nil
 	}
 	rs := histogramRanges(bounds)
 	if len(rs) < minBinsPerWorker*opt.jobs {
 		return nil, fmt.Sprintf("the histogram of %s has %d bins, fewer than %d per worker",
-			k.name, len(rs), minBinsPerWorker)
+			k.name, len(rs), minBinsPerWorker), nil
 	}
-	return rs, ""
+	return rs, "", nil
 }
 
 // mapSplit cuts the key space by the blocks of a map stored on the
@@ -271,14 +278,11 @@ func histogramRanges(b []string) []keyRange {
 // composite key) may have a value frequent enough to span several bins, and
 // each repeat would make an empty range.
 //
-// The query runs under a savepoint: a type that cannot read its own text
-// back fails here, and the caller can go on without parallelism.
+// A failure here aborts the coordinator's transaction, so the run stops.
+// Types whose histogram is known not to parse are never asked for it
+// (histogramUnreadable).
 func (s *side) histogram(ctx context.Context, d *description, col, typ string) ([]string, error) {
-	sp, err := s.tx.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := sp.Query(ctx, fmt.Sprintf(`
+	rows, err := s.tx.Query(ctx, fmt.Sprintf(`
 		SELECT b::text
 		FROM (SELECT b, o, lag(b) OVER (ORDER BY o) AS prev
 		      FROM pg_catalog.pg_stats s,
@@ -293,8 +297,24 @@ func (s *side) histogram(ctx context.Context, d *description, col, typ string) (
 		b, err = pgx.CollectRows(rows, pgx.RowTo[string])
 	}
 	if err != nil {
-		_ = sp.Rollback(ctx)
 		return nil, fmt.Errorf("%s: histogram of %s.%s: %w", s.name, d.qualifiedName(), col, err)
 	}
-	return b, sp.Commit(ctx)
+	return b, nil
+}
+
+// histogramUnreadable says why the histogram of a key column of this type
+// is not read, or "" if it is. The histogram is read as its text cast to an
+// array of the column type, and two kinds of type fail that cast: an array
+// (the bounds are arrays themselves, and their text does not parse as the
+// element type) and a type whose text does not identify the value
+// (regproc prints an overloaded function as a bare name). Such a key is cut
+// by the slicer without trying: the failed query would abort the run.
+func histogramUnreadable(c column) string {
+	switch {
+	case c.category == "A":
+		return fmt.Sprintf("the histogram of an array (%s) is not read", c.typeName)
+	case unambiguousKeyType[c.typeOID] != "":
+		return fmt.Sprintf("the histogram of %s is not read: its text does not identify the value", c.typeName)
+	}
+	return ""
 }

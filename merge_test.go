@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -167,11 +168,23 @@ func TestNegotiate(t *testing.T) {
 		t.Fatalf("unexpected casts for b: %+v", b)
 	}
 
-	// No common type is an error.
+	// No common type is an error, and the first one stops: the probe that
+	// finds it aborts the transaction, so the server is asked nothing more.
 	tst.columns[1].typeName = "character varying(10)"
-	if _, err := negotiate(ref, tst, nil, fakeCommon); err == nil {
-		t.Fatal("expected a no-common-type error")
+	tst.columns[3].typeName = "integer" // a: text against integer, before b
+	asked := 0
+	counting := func(c1, c2 column) (string, error) { asked++; return fakeCommon(c1, c2) }
+	_, err = negotiate(ref, tst, nil, counting)
+	if err == nil || !strings.Contains(err.Error(), `column "a"`) || asked != 1 {
+		t.Fatalf("got %v after %d probes, want the error of column a after 1", err, asked)
 	}
+	// Missing columns are all reported first, with no probe at all.
+	asked = 0
+	_, err = negotiate(ref, tst, []string{"a", "only_ref", "only_test", "b"}, counting)
+	if err == nil || !strings.Contains(err.Error(), "only_ref") || !strings.Contains(err.Error(), "only_test") || asked != 0 {
+		t.Fatalf("got %v after %d probes, want both missing columns and no probe", err, asked)
+	}
+	tst.columns[3].typeName = "text"
 
 	tst.columns[1].typeName = "numeric(10,2)"
 

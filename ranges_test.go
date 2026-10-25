@@ -133,6 +133,28 @@ func TestSliceBlockQueries(t *testing.T) {
 	}
 }
 
+// Key types whose histogram would fail to parse are never asked for it.
+func TestHistogramUnreadable(t *testing.T) {
+	cases := []struct {
+		c    column
+		want string // a word of the reason; "" = readable
+	}{
+		{column{typeName: "integer", typeOID: 23, category: "N"}, ""},
+		{column{typeName: `"text"`, typeOID: 25, category: "S"}, ""},
+		{column{typeName: "integer[]", typeOID: 1007, category: "A"}, "array"},
+		{column{typeName: `"text"[]`, typeOID: 1009, category: "A"}, "array"},
+		{column{typeName: "regproc", typeOID: 24, category: "N"}, "identify"},
+		{column{typeName: "regoper", typeOID: 2203, category: "N"}, "identify"},
+		{column{typeName: "regclass", typeOID: 2205, category: "N"}, ""},
+	}
+	for _, c := range cases {
+		got := histogramUnreadable(c.c)
+		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
+			t.Errorf("%s: got %q, want a reason with %q", c.c.typeName, got, c.want)
+		}
+	}
+}
+
 // Merge inlines integer bounds and never anything else.
 func TestBuildQueryBoundLiteral(t *testing.T) {
 	p := &plan{key: []keyCol{{colPlan: colPlan{name: "id"}, base: [2]string{"integer", "bigint"}}}}

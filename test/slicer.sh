@@ -117,6 +117,12 @@ both "CREATE TABLE procs (f regproc PRIMARY KEY, v text)"
 both "INSERT INTO procs SELECT oid::regproc, proname FROM pg_proc"
 sql "$D2" "UPDATE procs SET v = 'changed' WHERE f::regprocedure::text LIKE 'avg(%' OR f::regprocedure::text LIKE 'sum(%'"
 
+# Keyed by an array: the histogram of an array column does not parse as
+# an array of the column type, so the histogram cannot be read.
+both "CREATE TABLE arr (k int[] PRIMARY KEY, v text)"
+both "INSERT INTO arr SELECT ARRAY[g / 100, g % 100], 'v' FROM generate_series(1, 20000) g"
+sql "$D2" "UPDATE arr SET v = 'changed' WHERE k[2] = 7"
+
 both "VACUUM ANALYZE"
 # Never analysed: no histogram, no reltuples.
 both "CREATE TABLE fresh (id int PRIMARY KEY, v text)"
@@ -163,6 +169,17 @@ logs e_small.rows1 "slicer: 300 bounds" "blocks of one row: 300 bounds"
 echo "--- regproc key"
 run procs.seq 1 -table procs
 run procs.fixed 1 -table procs -split fixed -rows 7 -j 4 && set_ procs.seq procs.fixed
+
+# The histogram of these key types does not parse, and a failed query
+# would abort the coordinator's transaction (and the export of its snapshot
+# for the workers): it is not read at all, and the slicer cuts.
+echo "--- a histogram that cannot be read: the slicer, without trying"
+run procs.par 1 -table procs -j 4 && set_ procs.seq procs.par
+logs procs.par "the histogram of .*regproc.* is not read" "regproc: not read, and why"
+logs procs.par "slicer: " "the slicer cut instead"
+run arr.seq 1 -table arr
+run arr.par 1 -table arr -j 4 -rows 1000 && set_ arr.seq arr.par
+logs arr.par "the histogram of an array (integer\[\]) is not read" "an array: not read, and why"
 
 echo "--- filter: blocks over the matching rows only"
 run big.fseq 1 -table big -filter "id % 100 = 0"

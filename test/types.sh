@@ -63,6 +63,17 @@ sql "$D2" "CREATE TABLE u (id int PRIMARY KEY, m text)"
 expect "enum vs text: no common type" 2 -table u
 grep -h 'no common type' "$WORK/log" | sed 's/^/    /'
 
+# Two columns with no common type: the first one stops the run with its
+# own error, not with the "transaction is aborted" of the second probe.
+sql "$D1" "CREATE TABLE u2 (id int PRIMARY KEY, a mood, b int)"
+sql "$D2" "CREATE TABLE u2 (id int PRIMARY KEY, a text, b bytea)"
+expect "two columns without a common type: an error" 2 -table u2
+if grep -q 'column "a": no common type' "$WORK/log" && ! grep -q 'aborted' "$WORK/log"; then
+	echo "ok   the first column stops the run, with its own error"
+else
+	echo "FAIL expected the error of column a alone"; sed 's/^/    /' "$WORK/log"; FAILED=1
+fi
+
 # The server drops differing modifiers. Nothing may be lost on the way:
 # 15.554 vs 15.55 must stay a difference (casting to numeric(10,2) would
 # have rounded it away), microseconds vs milliseconds must stay a
